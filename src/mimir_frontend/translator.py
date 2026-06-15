@@ -80,8 +80,9 @@ class FXGraphTranslator:
         # Injective
         m[torch.cat] = self._wrap_unsupported("aten.cat")
         m["aten.cat.default"] = self._wrap_unsupported("aten.cat")
-        m[torch.permute] = self._wrap_unsupported("aten.permute")
-        m["aten.permute.default"] = self._wrap_unsupported("aten.permute")
+        m[torch.permute] = self._wrap_transpose()
+        m["aten.permute.default"] = self._wrap_transpose()
+        m["t"] = self._wrap_t()
         
         # Broadcast
         m[torch.expand_copy] = self._wrap_expand()
@@ -169,6 +170,20 @@ class FXGraphTranslator:
             return self.ops.where(args[0], args[1], args[2])
         return convert
 
+    def _wrap_t(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            return self.ops.transpose(args[0], [1, 0])
+        return convert
+
+    def _wrap_transpose(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            permutation = args[1]
+            return self.ops.transpose(x, permutation)
+        return convert
+
     def _wrap_getitem(self):
         def convert(node: fx.Node):
             args = self.retrieve_args(node)
@@ -246,26 +261,73 @@ class FXGraphTranslator:
         else:
             return args
 
+    def translate_as_function(self, graph: fx.Graph, input_types: list[mim.Def], name: str = "main", sym_names: list[str] = None) -> mim.Lam:
+        placeholders = [node for node in graph.nodes if node.op == "placeholder"]
+        param_nodes = [node for node in graph.nodes if node.op == "get_attr"]
+        num_inputs = len(placeholders) + len(param_nodes)
+        num_sym = len(sym_names) if sym_names else 0
+        
+        # 1. Determine the output type by dry-running translation with dummy variables
+        dummy_inputs = [self.world.mut_con(it).var() for it in input_types[-num_inputs:]]
+        
+        old_env = self.env
+        old_sym_map = self.ops.sym_map
+        self.env = {}
+        # Temporarily use dummy symbols for dry run if needed
+        # ...
+        
+        res_def = self.translate(graph, dummy_inputs)
+        out_type = res_def.type()
+        self.env = old_env
+
+        # 2. Create the closed function (Lambda)
+        dom = self.world.sigma(input_types)
+        lam = self.world.mut_lam(dom, out_type)
+        lam.set(name)
+        
+        # 3. Map lambda parameters to FX placeholders and get_attr nodes
+        all_params = [lam.var().proj(len(input_types), i) for i in range(len(input_types))]
+        
+        # Map symbols
+        if sym_names:
+            for i, n in enumerate(sym_names):
+                self.ops.sym_map[n] = all_params[i]
+                
+        actual_inputs = all_params[num_sym:]
+        
+        # 4. Perform actual translation
+        result = self.translate(graph, actual_inputs)
+        lam.set_body(True, result)
+        
+        # Externalize only after it's closed (body set)
+        lam.externalize()
+        
+        # Restore sym_map
+        self.ops.sym_map = old_sym_map
+        
+        return lam
+
     def translate(self, graph: fx.Graph, inputs: list[mim.Def]) -> mim.Def:
         self.env = {}
         placeholders = [node for node in graph.nodes if node.op == "placeholder"]
-        if len(placeholders) != len(inputs):
-            raise ValueError(f"Expected {len(placeholders)} inputs, got {len(inputs)}")
-        for node, arg in zip(placeholders, inputs):
+        param_nodes = [node for node in graph.nodes if node.op == "get_attr"]
+        
+        # Track symbolic info for inputs
+        self.ops.input_to_syms = {}
+        
+        # Map placeholders to first part of inputs
+        for i, (node, arg) in enumerate(zip(placeholders, inputs[:len(placeholders)])):
+            self.env[node] = arg
+            if hasattr(self, "input_sym_names") and i < len(self.input_sym_names):
+                self.ops.input_to_syms[arg] = self.input_sym_names[i]
+            
+        # Map get_attr to the rest of inputs
+        for node, arg in zip(param_nodes, inputs[len(placeholders):]):
             self.env[node] = arg
 
         for node in graph.nodes:
-            if node.op == "placeholder":
+            if node.op in ("placeholder", "get_attr"):
                 continue
-            elif node.op == "get_attr":
-                if self.module is not None:
-                    # Resolve attribute
-                    attr = self.module
-                    for part in node.target.split("."):
-                        attr = getattr(attr, part)
-                    self.env[node] = attr
-                else:
-                    raise NotImplementedError(f"Op get_attr for {node.target} requires module access")
             elif node.op in ("call_function", "call_method"):
                 self.env[node] = self.convert_node(node)
             elif node.op == "output":
@@ -278,6 +340,32 @@ class FXGraphTranslator:
                     return res
             else:
                 raise NotImplementedError(f"Op {node.op} not implemented")
+
+
+    def _convert_tensor_constant(self, tensor: torch.Tensor) -> mim.Def:
+        # For now, let's treat weights as placeholders too, or real constants?
+        # If we want a completely closed module, we should embed them or pass them as args.
+        # Passing as args is cleaner for now.
+        # But if they are get_attr, they are already in the graph.
+        
+        # Simple strategy: Create a MimIR constant array if it's small, 
+        # or just a placeholder-like mutable if it's large.
+        # Given the requirement for a "mimir_module", maybe we should let the user
+        # decide which parameters become arguments.
+        
+        # For now, let's just create a mutable with the right type.
+        shape = list(tensor.shape)
+        dtype = tensor.dtype
+        if dtype == torch.float32:
+            elem_t = self.ops.F32
+        elif dtype == torch.bool:
+            elem_t = self.ops.Bool
+        else:
+            raise NotImplementedError(f"Tensor constant with dtype {dtype} not supported")
+            
+        mim_shape = self.world.tuple([self.world.lit_nat(d) for d in shape])
+        return self.world.mut_con(self.world.arr(mim_shape, elem_t)).var()
+
 
     def convert_node(self, node: fx.Node) -> mim.Def:
         target = node.target

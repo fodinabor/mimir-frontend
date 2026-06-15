@@ -12,6 +12,8 @@ class OperatorLibrary:
         self.F32 = world.annex(math.F32.value)
         self.Bool = world.type_bool()
         self.mode0 = world.lit_nat_0()
+        self.sym_map = {} # Mapping from symbolic name to MimIR Nat variable
+
         
         def bind_math_axm(axm_enum):
             axm = world.annex(axm_enum.value)
@@ -72,6 +74,17 @@ class OperatorLibrary:
         while isinstance(tensor_type, mim.Seq):
             dims.append(tensor_type.arity())
             tensor_type = tensor_type.body()
+            
+        if hasattr(self, "input_to_syms") and tensor_def in self.input_to_syms:
+            sym_names = self.input_to_syms[tensor_def]
+            final_dims = []
+            for i, name in enumerate(sym_names):
+                if name is not None and name in self.sym_map:
+                    final_dims.append(self.sym_map[name])
+                else:
+                    final_dims.append(dims[i])
+            return final_dims
+            
         return dims
 
     def _apply_grouped(self, callee, args):
@@ -136,6 +149,28 @@ class OperatorLibrary:
         in_type = self._tensor_element_type(lhs)
         if out_type is None:
             out_type = in_type
+            
+        # Broadcasting logic
+        s_lhs = self._shape_dims(lhs)
+        s_rhs = self._shape_dims(rhs)
+        if s_lhs != s_rhs:
+            # Very basic broadcasting: if one is a suffix of another or has 1s
+            # For now, let's just support the case where one needs to be expanded to match the other
+            # Rank matching is required for %tensor.broadcast
+            if len(s_lhs) > len(s_rhs):
+                rhs = self.expand(rhs, s_lhs)
+                s_rhs = s_lhs
+            elif len(s_rhs) > len(s_lhs):
+                lhs = self.expand(lhs, s_rhs)
+                s_lhs = s_rhs
+            # If same rank but different dims (1s), we still need broadcast
+            elif any(d1 != d2 for d1, d2 in zip(s_lhs, s_rhs)):
+                # Target shape: max of each dim
+                # ... 
+                # For now assume lhs is the target
+                rhs = self.expand(rhs, s_lhs)
+                s_rhs = s_lhs
+
         rank, shape = self._rank_and_shape(lhs)
         callee = self.world.annex(tensor.binary.value)
         callee = self._apply_grouped(callee, [in_type, in_type, out_type])
@@ -538,7 +573,13 @@ class OperatorLibrary:
 
     # Linear Algebra
     def mm(self, lhs, rhs):
-        raise NotImplementedError("aten.mm is not implemented")
+        # Ring: [T: *, _0: T, add: [T, T] -> T, mul: [T, T] -> T]
+        ring = self.world.tuple([self.F32, self._f32_float_lit(0.0), self.f32_add_axm, self.f32_mul_axm])
+        # 0x5463d44130001300 is product_2d
+        callee = self.world.annex(0x5463d44130001300)
+        callee = self.world.app(callee, ring)
+        return self.world.implicit_app(callee, [lhs, rhs])
+
 
     def convolution(self, x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         raise NotImplementedError("aten.convolution is not implemented")
@@ -548,4 +589,16 @@ class OperatorLibrary:
         raise NotImplementedError("aten.cat is not implemented")
 
     def transpose(self, x, permutation):
+        rank, shape = self._rank_and_shape(x)
+        elem_t = self._tensor_element_type(x)
+        
+        # permutation should be a list of ints
+        nat_t = self.world.type_nat()
+        idx_t = self.world.type_idx(rank)
+        perm_mim = self.world.tuple([self.world.lit(idx_t, p) for p in permutation])
+        
+        callee = self.world.annex(tensor.transpose.value)
+        callee = self._apply_grouped(callee, [elem_t, rank, shape])
+        return self.world.app(callee, [x, perm_mim])
+
         raise NotImplementedError("aten.permute is not implemented")
