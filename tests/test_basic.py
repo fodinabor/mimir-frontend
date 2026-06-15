@@ -267,3 +267,109 @@ def test_complex_operators_are_explicitly_unsupported(model, input_count):
 
     with pytest.raises(NotImplementedError):
         translate_model(model, inputs)
+
+@pytest.mark.parametrize("shape_kind", ["static", "dynamic"])
+@pytest.mark.parametrize("rank", [1, 3])
+def test_where_operator(shape_kind, rank):
+    class Model(torch.nn.Module):
+        def forward(self, cond, x, y):
+            return torch.where(cond, x, y)
+
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    cond_ty = make_tensor_type(world, world.type_bool(), shape_kind, rank)
+    cond_input = world.mut_con(cond_ty).var()
+    x_input, y_input = make_inputs(world, 2, shape_kind, rank)
+    
+    result = translate_model(Model(), [cond_input, x_input, y_input])
+    assert isinstance(result, mim.Def)
+    assert tensor_element_type(result) == ops.F32
+
+@pytest.mark.parametrize("shape_kind", ["static", "dynamic"])
+@pytest.mark.parametrize("rank", [1, 3])
+def test_clamp_scalar_bound(shape_kind, rank):
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return torch.clamp(x, min=-1.0, max=1.0)
+            
+    world = make_world()
+    result = translate_model(Model(), make_inputs(world, 1, shape_kind, rank))
+    assert isinstance(result, mim.Def)
+    assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
+
+@pytest.mark.parametrize("shape_kind", ["static", "dynamic"])
+@pytest.mark.parametrize("rank", [1, 3])
+def test_value_only_max(shape_kind, rank):
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return torch.max(x)
+
+    world = make_world()
+    result = translate_model(Model(), make_inputs(world, 1, shape_kind, rank))
+    assert isinstance(result, mim.Def)
+    assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
+    ir = def_to_string(result)
+    assert "%tensor.map_reduce_aff" in ir
+
+def test_tuple_max_is_unsupported():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return torch.max(x, dim=0)
+
+    world = make_world()
+    with pytest.raises(NotImplementedError):
+        translate_model(Model(), make_inputs(world, 1, "static", 3))
+
+@pytest.mark.parametrize("shape_kind", ["static", "dynamic"])
+@pytest.mark.parametrize("rank,dim,keepdim", [(1, None, False), (1, 0, True), (3, -1, True), (3, (1, 2), True)])
+def test_var_mean_all_shape_kinds_smoke(shape_kind, rank, dim, keepdim):
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return torch.var_mean(x, dim=dim, keepdim=keepdim, correction=0)
+
+    world = make_world()
+    result = translate_model(Model(), make_inputs(world, 1, shape_kind, rank))
+    assert isinstance(result, mim.Def)
+    # var_mean returns a tuple of (var, mean)
+    ir = def_to_string(result)
+    assert "%tensor.map_reduce_aff" in ir
+
+def test_bitwise_and_logical_not():
+    class Model(torch.nn.Module):
+        def forward(self, x, y):
+            b_x = x > 0
+            b_y = y > 0
+            return torch.logical_not(torch.bitwise_and(b_x, b_y))
+
+    world = make_world()
+    x_input, y_input = make_inputs(world, 2, "dynamic", 3)
+    result = translate_model(Model(), [x_input, y_input])
+    assert isinstance(result, mim.Def)
+    assert tensor_element_type(result) == world.type_bool()
+
+def test_convert_element_type():
+    import torch._prims as prims
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            b = prims.convert_element_type(x, torch.bool)
+            return prims.convert_element_type(b, torch.float32)
+
+    world = make_world()
+    x_input, = make_inputs(world, 1, "static", 3)
+    result = translate_model(Model(), [x_input])
+    assert isinstance(result, mim.Def)
+    assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
+
+def test_fma():
+    import torch._prims as prims
+    if not hasattr(prims, 'fma'):
+        pytest.skip("fma not available in this torch version")
+    class Model(torch.nn.Module):
+        def forward(self, a, b, c):
+            return prims.fma(a, b, c)
+
+    world = make_world()
+    inputs = make_inputs(world, 3, "dynamic", 1)
+    result = translate_model(Model(), inputs)
+    assert isinstance(result, mim.Def)
+    assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32

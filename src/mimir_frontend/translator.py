@@ -34,6 +34,8 @@ class FXGraphTranslator:
             (torch.ge, operator.ge, "aten.ge.default", self.ops.ge),
             (torch.clamp_max, None, "aten.clamp_max.default", self.ops.clamp_max),
             (torch.clamp_min, None, "aten.clamp_min.default", self.ops.clamp_min),
+            (torch.bitwise_and, operator.and_, "aten.bitwise_and.default", self.ops.bitwise_and),
+            (None, None, "aten.bitwise_and.Tensor", self.ops.bitwise_and),
         ]
         
         for t, op, name, func in binary_ops:
@@ -41,6 +43,10 @@ class FXGraphTranslator:
             if t: m[t] = wrapper
             if op: m[op] = wrapper
             if name: m[name] = wrapper
+
+        m[torch.clamp] = self._wrap_clamp()
+        m["aten.clamp.default"] = self._wrap_clamp()
+        m["aten.clamp.Tensor"] = self._wrap_clamp()
 
         # Elementwise Unary
         unary_ops = [
@@ -53,12 +59,20 @@ class FXGraphTranslator:
             (torch.sigmoid, "aten.sigmoid.default", self.ops.sigmoid),
             (torch.reciprocal, "aten.reciprocal.default", self.ops.reciprocal),
             (torch.rsqrt, "aten.rsqrt.default", self.ops.rsqrt),
+            (torch.logical_not, "aten.logical_not.default", self.ops.logical_not),
         ]
         
         for t, name, func in unary_ops:
             wrapper = self._wrap_unary(func)
             if t: m[t] = wrapper
             if name: m[name] = wrapper
+
+        # Prims
+        if hasattr(torch.ops, "prims") and hasattr(torch.ops.prims, "convert_element_type"):
+            m[torch.ops.prims.convert_element_type.default] = self._wrap_convert_element_type()
+        m["prims.convert_element_type.default"] = self._wrap_convert_element_type()
+        m["aten.convert_element_type.default"] = self._wrap_convert_element_type()
+        m["prims.fma.default"] = self._wrap_fma()
 
         # Injective
         m[torch.cat] = self._wrap_unsupported("aten.cat")
@@ -72,12 +86,15 @@ class FXGraphTranslator:
         m["aten.sum.dim_IntList"] = self._wrap_reduction(self.ops.sum)
         m[torch.amax] = self._wrap_reduction(self.ops.amax)
         m["aten.amax.default"] = self._wrap_reduction(self.ops.amax)
+        m[torch.max] = self._wrap_max()
+        m["aten.max.default"] = self._wrap_max()
+        m["aten.max.dim"] = self._wrap_max()
         m[torch.mean] = self._wrap_reduction(self.ops.mean)
         m["aten.mean.default"] = self._wrap_reduction(self.ops.mean)
         m["aten.mean.dim"] = self._wrap_reduction(self.ops.mean)
-        m[torch.var_mean] = self._wrap_reduction(self.ops.var_mean)
-        m["aten.var_mean.default"] = self._wrap_reduction(self.ops.var_mean)
-        m["aten.var_mean.correction"] = self._wrap_reduction(self.ops.var_mean)
+        m[torch.var_mean] = self._wrap_var_mean()
+        m["aten.var_mean.default"] = self._wrap_var_mean()
+        m["aten.var_mean.correction"] = self._wrap_var_mean()
 
         # Linear Algebra
         m[torch.mm] = self._wrap_binary(self.ops.mm)
@@ -90,6 +107,9 @@ class FXGraphTranslator:
         # Selection
         m[torch.where] = self._wrap_where()
         m["aten.where.self"] = self._wrap_where()
+
+        # Tuple operations
+        m[operator.getitem] = self._wrap_getitem()
 
         return m
 
@@ -114,10 +134,59 @@ class FXGraphTranslator:
             return op_func(input_def, dim=dim, keepdim=keepdim)
         return convert
 
+    def _wrap_max(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            if len(args) > 1 or "dim" in node.kwargs:
+                raise NotImplementedError("torch.max with dim is not implemented (requires tuple return)")
+            return self.ops.amax(args[0], dim=None, keepdim=False)
+        return convert
+
+    def _wrap_var_mean(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            input_def = args[0]
+            dim = args[1] if len(args) > 1 else node.kwargs.get("dim", None)
+            keepdim = args[2] if len(args) > 2 else node.kwargs.get("keepdim", False)
+            correction = args[3] if len(args) > 3 else node.kwargs.get("correction", 1)
+            return self.ops.var_mean(input_def, dim=dim, keepdim=keepdim, correction=correction)
+        return convert
+
     def _wrap_where(self):
         def convert(node: fx.Node):
             args = self.retrieve_args(node)
             return self.ops.where(args[0], args[1], args[2])
+        return convert
+
+    def _wrap_getitem(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            tup = args[0]
+            index = args[1]
+            return tup.proj(tup.num_projs(), index)
+        return convert
+
+    def _wrap_clamp(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            min_val = args[1] if len(args) > 1 else node.kwargs.get("min")
+            max_val = args[2] if len(args) > 2 else node.kwargs.get("max")
+            return self.ops.clamp(x, min_val=min_val, max_val=max_val)
+        return convert
+
+    def _wrap_convert_element_type(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            dtype = args[1] if len(args) > 1 else node.kwargs.get("dtype")
+            return self.ops.convert_element_type(x, dtype)
+        return convert
+
+    def _wrap_fma(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            return self.ops.fma(args[0], args[1], args[2])
         return convert
 
     def _wrap_unsupported(self, name: str):
