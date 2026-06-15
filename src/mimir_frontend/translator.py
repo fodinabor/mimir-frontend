@@ -6,9 +6,12 @@ from mim._plugins.compile import compile as mim_compile
 import operator
 from collections.abc import Callable
 
+import builtins
+
 class FXGraphTranslator:
-    def __init__(self, world: mim.World):
+    def __init__(self, world: mim.World, module: torch.nn.Module = None):
         self.world = world
+        self.module = module
         self.ops = OperatorLibrary(world)
         self.env: dict[fx.Node, mim.Def] = {}
         self.convert_map: dict[str | Callable, Callable[[fx.Node], mim.Def]] = self.create_convert_map()
@@ -79,6 +82,13 @@ class FXGraphTranslator:
         m["aten.cat.default"] = self._wrap_unsupported("aten.cat")
         m[torch.permute] = self._wrap_unsupported("aten.permute")
         m["aten.permute.default"] = self._wrap_unsupported("aten.permute")
+        
+        # Broadcast
+        m[torch.expand_copy] = self._wrap_expand()
+        m["aten.expand.default"] = self._wrap_expand()
+        m["expand"] = self._wrap_expand()
+        m[torch.full] = self._wrap_full()
+        m["aten.full.default"] = self._wrap_full()
 
         # Reductions
         m[torch.sum] = self._wrap_reduction(self.ops.sum)
@@ -110,6 +120,7 @@ class FXGraphTranslator:
 
         # Tuple operations
         m[operator.getitem] = self._wrap_getitem()
+        m[builtins.getattr] = self._wrap_getattr()
 
         return m
 
@@ -166,6 +177,17 @@ class FXGraphTranslator:
             return tup.proj(tup.num_projs(), index)
         return convert
 
+    def _wrap_getattr(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            obj = args[0]
+            attr_name = args[1] if len(args) > 1 else node.kwargs.get("name")
+            if attr_name == "shape":
+                return self.ops._shape_dims(obj)
+            else:
+                raise NotImplementedError(f"getattr for {attr_name} is not implemented")
+        return convert
+
     def _wrap_clamp(self):
         def convert(node: fx.Node):
             args = self.retrieve_args(node)
@@ -187,6 +209,23 @@ class FXGraphTranslator:
         def convert(node: fx.Node):
             args = self.retrieve_args(node)
             return self.ops.fma(args[0], args[1], args[2])
+        return convert
+
+    def _wrap_expand(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            shape = args[1:] if len(args) > 2 else args[1]
+            return self.ops.expand(x, shape)
+        return convert
+
+    def _wrap_full(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            shape = args[0]
+            fill_value = args[1] if len(args) > 1 else node.kwargs.get("fill_value")
+            dtype = args[2] if len(args) > 2 else node.kwargs.get("dtype")
+            return self.ops.full(shape, fill_value, dtype=dtype)
         return convert
 
     def _wrap_unsupported(self, name: str):
@@ -218,6 +257,15 @@ class FXGraphTranslator:
         for node in graph.nodes:
             if node.op == "placeholder":
                 continue
+            elif node.op == "get_attr":
+                if self.module is not None:
+                    # Resolve attribute
+                    attr = self.module
+                    for part in node.target.split("."):
+                        attr = getattr(attr, part)
+                    self.env[node] = attr
+                else:
+                    raise NotImplementedError(f"Op get_attr for {node.target} requires module access")
             elif node.op in ("call_function", "call_method"):
                 self.env[node] = self.convert_node(node)
             elif node.op == "output":

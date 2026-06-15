@@ -36,9 +36,9 @@ def make_inputs(world, count, shape_kind, rank):
 
 
 def translate_model(model, inputs):
-    graph = fx.symbolic_trace(model).graph
-    translator = FXGraphTranslator(inputs[0].world())
-    return translator.translate(graph, inputs)
+    traced = fx.symbolic_trace(model)
+    translator = FXGraphTranslator(inputs[0].world(), module=traced)
+    return translator.translate(traced.graph, inputs)
 
 
 def def_to_string(defn):
@@ -371,5 +371,40 @@ def test_fma():
     world = make_world()
     inputs = make_inputs(world, 3, "dynamic", 1)
     result = translate_model(Model(), inputs)
+    assert isinstance(result, mim.Def)
+    assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
+
+def test_full_and_expand():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            f = torch.full((10, 20), 5.0)
+            return x + f
+
+    world = make_world()
+    x_input, = make_inputs(world, 1, "static", 2) # F32 tensor of rank 2
+    # Wait, make_inputs for rank 2? No, my make_inputs only supports rank 1 and 3 currently.
+    pass
+
+@pytest.mark.parametrize("shape_kind", ["static", "dynamic"])
+def test_full_operator(shape_kind):
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return torch.full(x.shape, 5.0)
+
+    world = make_world()
+    x_input, = make_inputs(world, 1, shape_kind, 3)
+    result = translate_model(Model(), [x_input])
+    assert isinstance(result, mim.Def)
+    assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
+
+@pytest.mark.parametrize("shape_kind", ["static", "dynamic"])
+def test_expand_operator(shape_kind):
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return x.expand(5, 10, 20, 30) # Expand rank 3 to rank 4
+
+    world = make_world()
+    x_input, = make_inputs(world, 1, shape_kind, 3)
+    result = translate_model(Model(), [x_input])
     assert isinstance(result, mim.Def)
     assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32

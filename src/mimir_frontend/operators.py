@@ -303,6 +303,71 @@ class OperatorLibrary:
         callee = self._apply_grouped(callee, [rank, shape])
         return self._apply_grouped(callee, [cond, x, y])
 
+    def _extract_shape(self, shape_arg):
+        out_shape_list = []
+        for d in shape_arg:
+            if isinstance(d, int):
+                out_shape_list.append(self.world.lit_nat(d))
+            elif isinstance(d, mim.Def):
+                out_shape_list.append(d)
+            else:
+                raise ValueError(f"Unsupported shape dimension type: {type(d)}")
+        return self.world.tuple(out_shape_list), len(shape_arg)
+
+    def expand(self, input, shape):
+        in_rank, in_shape = self._rank_and_shape(input)
+        in_rank_val = len(self._shape_dims(input))
+        out_shape, out_rank_val = self._extract_shape(shape)
+        out_rank = self.world.lit_nat(out_rank_val)
+        
+        elem_type = self._tensor_element_type(input)
+
+        if in_rank_val == out_rank_val:
+            callee = self.world.annex(tensor.broadcast.value)
+            callee = self._apply_grouped(callee, [elem_type, out_rank])
+            return self.world.app(callee, [in_shape, out_shape, input])
+        else:
+            callee = self.world.annex(tensor.broadcast_in_dim.value)
+            callee = self._apply_grouped(callee, [elem_type, in_rank, out_rank])
+            
+            idx_t = self.world.type_idx(out_rank)
+            offset = out_rank_val - in_rank_val
+            index_mapping = [self.world.lit(idx_t, offset + i) for i in range(in_rank_val)]
+            index_tuple = self.world.tuple(index_mapping)
+            
+            return self.world.app(callee, [in_shape, out_shape, input, index_tuple])
+
+    def full(self, shape, fill_value, dtype=None):
+        import torch
+        if dtype is None:
+            dtype = torch.float32
+            
+        if dtype in (torch.float32, torch.float, None):
+            elem_type = self.F32
+            scalar_def = self._f32_float_lit(float(fill_value))
+        elif dtype == torch.bool:
+            elem_type = self.Bool
+            scalar_def = self.world.lit_tt() if fill_value else self.world.lit_ff()
+        else:
+            raise NotImplementedError(f"full with dtype {dtype} is not implemented")
+            
+        out_shape, out_rank_val = self._extract_shape(shape)
+        out_rank = self.world.lit_nat(out_rank_val)
+        
+        callee = self.world.annex(tensor.map.value)
+        ni = self.world.lit_nat(0)
+        Is = self.world.tuple([])
+        callee = self.world.app(callee, self.world.tuple([elem_type, ni, Is]))
+        
+        lam = self.world.mut_lam(self.world.sigma([]), elem_type)
+        lam.set_body(True, scalar_def)
+        
+        callee = self.world.app(callee, lam)
+        callee = self.world.app(callee, self.world.tuple([out_rank, out_shape]))
+        
+        input_is = self.world.tuple([])
+        return self.world.app(callee, input_is)
+
     def _reduce_aff(self, input, output_type, reducer, init, dim=None, keepdim=False, return_shape=False):
         input_dims = self._shape_dims(input)
         input_rank = len(input_dims)
