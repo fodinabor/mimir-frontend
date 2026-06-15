@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mimir-frontend"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "torch",
+    "mim",
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mimir_frontend = ["py.typed"]
+
+[tool.uv.sources]
+mim = { path = "../../MimIR/build/mim_py_stage/main" }
+
+[tool.ty.environment]
+python = ".venv"
+python-version = "3.14"

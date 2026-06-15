@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+src/mimir_frontend/operators.py
+src/mimir_frontend/translator.py
+src/mimir_frontend.egg-info/PKG-INFO
+src/mimir_frontend.egg-info/SOURCES.txt
+src/mimir_frontend.egg-info/dependency_links.txt
+src/mimir_frontend.egg-info/requires.txt
+src/mimir_frontend.egg-info/top_level.txt
+tests/test_basic.py
