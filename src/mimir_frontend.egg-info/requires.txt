@@ -1,3 +1,4 @@
 torch
 mim
 pytest
+numpy>=2.4.6

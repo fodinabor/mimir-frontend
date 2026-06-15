@@ -5,3 +5,4 @@ Requires-Python: >=3.14
 Requires-Dist: torch
 Requires-Dist: mim
 Requires-Dist: pytest
+Requires-Dist: numpy>=2.4.6
