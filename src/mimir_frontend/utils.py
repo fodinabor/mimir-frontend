@@ -93,6 +93,10 @@ def model_to_mimir(
         input_sym_names.append(this_input_syms)
 
     # 2. Construct Domain Type: [sym_dims..., tensor_inputs..., params...]
+    # In MimIR, the function domain is represented as a Sigma (tuple) type.
+    # For example, if a model takes a tensor with a dynamic batch size 'n': (n, 20)
+    # The generated MimIR function signature will be:
+    # `lam extern mimir_module (n: Nat, arg0: «n, 20; F32», weight: «256, 20; F32»)`
     nat_t = world.type_nat()
     dom_types = [nat_t] * len(sym_names)
     
@@ -103,6 +107,7 @@ def model_to_mimir(
         tensor_input_types.append(world.arr(world.tuple(dims), ops.F32))
         
     # Parameters
+    # FX weights/biases (extracted from get_attr) are passed as trailing arguments
     param_types = []
     for target in param_names:
         attr = traced
@@ -117,7 +122,9 @@ def model_to_mimir(
     translator.input_sym_names = input_sym_names
     
     # 3. Create the real Module Function
+    # Translate the entire FX graph into a closed `lam extern`
     result_lam = translator.translate_as_function(graph, full_dom_types, name=name, sym_names=sym_names)
+
 
 
 

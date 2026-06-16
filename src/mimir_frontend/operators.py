@@ -362,11 +362,21 @@ class OperatorLibrary:
 
     # Logical
     def where(self, cond, x, y):
-        tensor_type = x.type()
-        while isinstance(tensor_type, mim.Seq):
-            tensor_type = tensor_type.body()
-        
-        rank, shape = self._rank_and_shape(x)
+        cond_dims = self._shape_dims(cond)
+        x_dims = self._shape_dims(x)
+        y_dims = self._shape_dims(y)
+        output_dims = self._broadcast_shape_dims(self._broadcast_shape_dims(cond_dims, x_dims), y_dims)
+
+        if not self._same_shape_dims(cond_dims, output_dims):
+            cond = self.expand(cond, output_dims)
+        if not self._same_shape_dims(x_dims, output_dims):
+            x = self.expand(x, output_dims)
+        if not self._same_shape_dims(y_dims, output_dims):
+            y = self.expand(y, output_dims)
+
+        tensor_type = self._tensor_element_type(x)
+        rank = self.world.lit_nat(len(output_dims))
+        shape = self.world.tuple(output_dims)
         callee = self.world.annex(tensor.select.value)
         callee = self.world.app(callee, tensor_type)
         callee = self._apply_grouped(callee, [rank, shape])
@@ -387,7 +397,23 @@ class OperatorLibrary:
         in_rank, in_shape = self._rank_and_shape(input)
         in_dims = self._shape_dims(input)
         in_rank_val = len(in_dims)
-        
+
+        shape = list(shape)
+        out_rank_val = len(shape)
+        rank_offset = out_rank_val - in_rank_val
+        resolved_shape = []
+        for i, dim in enumerate(shape):
+            if dim != -1:
+                resolved_shape.append(dim)
+                continue
+            input_index = i - rank_offset
+            if input_index < 0 and i < in_rank_val:
+                input_index = i
+            if input_index < 0 or input_index >= in_rank_val:
+                raise ValueError(f"cannot infer expand dimension {i} from input rank {in_rank_val}")
+            resolved_shape.append(in_dims[input_index])
+
+        shape = resolved_shape
         out_shape_tuple, out_rank_val = self._extract_shape(shape)
         out_rank = self.world.lit_nat(out_rank_val)
         
@@ -395,6 +421,15 @@ class OperatorLibrary:
             return input
 
         elem_type = self._tensor_element_type(input)
+
+        if in_rank_val == 0:
+            callee = self.world.annex(tensor.map.value)
+            callee = self.world.app(callee, self.world.tuple([elem_type, self.world.lit_nat(0), self.world.tuple([])]))
+            lam = self.world.mut_lam(self.world.sigma([]), elem_type)
+            lam.set_body(True, input)
+            callee = self.world.app(callee, lam)
+            callee = self.world.app(callee, self.world.tuple([out_rank, out_shape_tuple]))
+            return self.world.app(callee, self.world.tuple([]))
 
         if in_rank_val == out_rank_val:
             callee = self.world.annex(tensor.broadcast.value)
@@ -535,6 +570,13 @@ class OperatorLibrary:
         return self._unary_with_types(pair_type, self.F32, self._f32_pair_to_mean_lambda(pair_type), reduced, rank, shape)
 
     def _f32_var_mean_reduce_lambda(self, acc_type):
+        """
+        Creates the reduction lambda for var_mean which maintains (sum, sum_sq, count).
+        Effectively:
+          def reducer(acc, value):
+              sum_acc, sum_sq_acc, count_acc = acc
+              return (sum_acc + value, sum_sq_acc + value*value, count_acc + 1)
+        """
         args_type = self.world.sigma([acc_type, self.F32])
         lam = self.world.mut_con([args_type, self.world.cn([acc_type])])
         args = lam.var(0)
@@ -556,6 +598,12 @@ class OperatorLibrary:
         return lam
 
     def _f32_acc_to_var_mean(self, acc_type, extract_var=True):
+        """
+        Finalizer map step for var_mean.
+        Extracts `mean` or `var` from the accumulator tuple:
+          mean = sum / count
+          var = (sum_sq / count) - (mean * mean)
+        """
         lam = self.world.mut_lam(acc_type, self.F32)
         acc = lam.var()
         s = acc.proj(3, 0)
@@ -575,6 +623,14 @@ class OperatorLibrary:
         return lam
 
     def var_mean(self, input, dim=None, keepdim=False, correction=0):
+        """
+        Translates torch.var_mean into a map-reduce operation that yields a tuple (var, mean).
+        
+        MimIR Pipeline:
+        1. Uses `%tensor.map_reduce_aff` to accumulate `(sum, sum_sq, count)` into a 3-element array.
+        2. Projects this accumulator tensor into `var` and `mean` using two separate `%tensor.unary` operations.
+        3. Returns a MimIR tuple containing the two resulting tensors.
+        """
         if correction != 0:
             raise NotImplementedError("var_mean with correction != 0 is not implemented")
             
@@ -743,13 +799,14 @@ class OperatorLibrary:
         if dim < 0: dim += rank_val
         
         extent = in_dims[dim]
+        extent_value = self._dim_literal_value(extent)
         slices = []
         if isinstance(split_size_or_sections, int):
             split_size = split_size_or_sections
-            if isinstance(extent, int):
+            if extent_value is not None:
                 curr = 0
-                while curr < extent:
-                    end = min(curr + split_size, extent)
+                while curr < extent_value:
+                    end = min(curr + split_size, extent_value)
                     slices.append(self.slice(x, dim, curr, end))
                     curr = end
             else:

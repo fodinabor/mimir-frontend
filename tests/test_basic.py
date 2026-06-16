@@ -236,6 +236,71 @@ def test_binary_broadcast_rejects_incompatible_static_shape():
 
 
 @pytest.mark.parametrize(
+    "aten_op",
+    [
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.sub.Tensor,
+        torch.ops.aten.mul.Tensor,
+    ],
+)
+def test_real_aten_tensor_binary_overloads(aten_op):
+    class Model(torch.nn.Module):
+        def forward(self, x, y):
+            return aten_op(x, y)
+
+    world = make_world()
+    result = translate_model(Model(), make_inputs(world, 2, "dynamic", 3))
+
+    assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
+    assert "%tensor.binary" in def_to_string(result)
+
+
+@pytest.mark.parametrize(
+    "aten_op",
+    [
+        torch.ops.aten.le.Scalar,
+        torch.ops.aten.gt.Scalar,
+        torch.ops.aten.eq.Scalar,
+    ],
+)
+def test_real_aten_scalar_comparison_overloads_return_bool(aten_op):
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return aten_op(x, 0)
+
+    world = make_world()
+    result = translate_model(Model(), make_inputs(world, 1, "dynamic", 3))
+
+    assert tensor_element_type(result) == world.type_bool()
+    assert "%tensor.unary" in def_to_string(result)
+
+
+def test_real_aten_scalar_mul_overload():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return torch.ops.aten.mul.Scalar(x, 2)
+
+    world = make_world()
+    result = translate_model(Model(), make_inputs(world, 1, "dynamic", 3))
+
+    assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
+    assert "%tensor.unary" in def_to_string(result)
+
+
+def test_addmm_decomposes_to_mm_and_add():
+    class Model(torch.nn.Module):
+        def forward(self, bias, x, y):
+            return torch.ops.aten.addmm.default(bias, x, y)
+
+    world = make_world()
+    bias, x, y = make_static_inputs_with_shapes(world, [(4,), (2, 3), (3, 4)])
+    result = translate_model(Model(), [bias, x, y])
+
+    assert tensor_shape_values(result) == [2, 4]
+    assert_ir_contains_in_order(def_to_string(result), ["%tensor.product_2d", "%tensor.binary"])
+
+
+@pytest.mark.parametrize(
     "dim,keepdim,expected_shape",
     [
         (None, False, "((), (2, 3, 4))"),
@@ -340,6 +405,23 @@ def test_where_operator(shape_kind, rank):
     assert isinstance(result, mim.Def)
     assert tensor_element_type(result) == ops.F32
     assert "%tensor.select" in def_to_string(result)
+
+
+def test_where_broadcasts_scalar_branch_to_condition_shape():
+    class Model(torch.nn.Module):
+        def forward(self, cond, scalar, y):
+            return torch.ops.aten.where.self(cond, scalar, y)
+
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    cond, = make_static_inputs_with_shapes(world, [(2, 3, 4)], elem_type=world.type_bool())
+    scalar = world.mut_con(ops.F32).var()
+    y, = make_static_inputs_with_shapes(world, [(2, 3, 4)])
+
+    result = translate_model(Model(), [cond, scalar, y])
+
+    assert tensor_shape_values(result) == [2, 3, 4]
+    assert_ir_contains_in_order(def_to_string(result), ["%tensor.map", "%tensor.select"])
 
 @pytest.mark.parametrize("shape_kind", ["static", "dynamic"])
 @pytest.mark.parametrize("rank", [1, 3])
@@ -464,6 +546,33 @@ def test_expand_operator(shape_kind):
     result = translate_model(Model(), [x_input])
     assert isinstance(result, mim.Def)
     assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
+
+
+def test_expand_negative_one_keeps_input_dimension():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return x.expand(-1, 32)
+
+    world = make_world()
+    x, = make_static_inputs_with_shapes(world, [(5, 1)])
+    result = translate_model(Model(), [x])
+
+    assert tensor_shape_values(result) == [5, 32]
+    assert "%tensor.broadcast" in def_to_string(result)
+
+
+def test_split_tensor_overload_returns_tuple_of_slices():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            parts = torch.ops.aten.split.Tensor(x, 2, 1)
+            return parts[0] + parts[1]
+
+    world = make_world()
+    x, = make_static_inputs_with_shapes(world, [(3, 4)])
+    result = translate_model(Model(), [x])
+
+    assert tensor_shape_values(result) == [3, 2]
+    assert_ir_contains_in_order(def_to_string(result), ["%tensor.slice", "%tensor.slice", "%tensor.binary"])
 
 def test_reshape_operator():
     class Model(torch.nn.Module):

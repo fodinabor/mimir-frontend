@@ -21,31 +21,29 @@ class FXGraphTranslator:
         
         # Elementwise Binary
         binary_ops = [
-            (torch.add, operator.add, "aten.add.default", self.ops.add),
-            (torch.sub, operator.sub, "aten.sub.default", self.ops.sub),
-            (torch.mul, operator.mul, "aten.mul.default", self.ops.mul),
-            (torch.div, operator.truediv, "aten.div.default", self.ops.div),
-            (None, None, "aten.div.Tensor", self.ops.div),
-            (torch.maximum, None, "aten.maximum.default", self.ops.maximum),
-            (torch.minimum, None, "aten.minimum.default", self.ops.minimum),
-            (torch.eq, operator.eq, "aten.eq.default", self.ops.eq),
-            (None, None, "aten.eq.Tensor", self.ops.eq),
-            (torch.ne, operator.ne, "aten.ne.default", self.ops.ne),
-            (torch.lt, operator.lt, "aten.lt.default", self.ops.lt),
-            (torch.le, operator.le, "aten.le.default", self.ops.le),
-            (torch.gt, operator.gt, "aten.gt.default", self.ops.gt),
-            (torch.ge, operator.ge, "aten.ge.default", self.ops.ge),
-            (torch.clamp_max, None, "aten.clamp_max.default", self.ops.clamp_max),
-            (torch.clamp_min, None, "aten.clamp_min.default", self.ops.clamp_min),
-            (torch.bitwise_and, operator.and_, "aten.bitwise_and.default", self.ops.bitwise_and),
-            (None, None, "aten.bitwise_and.Tensor", self.ops.bitwise_and),
+            (torch.add, operator.add, ["aten.add.default", "aten.add.Tensor", "aten.add.Scalar"], self.ops.add),
+            (torch.sub, operator.sub, ["aten.sub.default", "aten.sub.Tensor", "aten.sub.Scalar"], self.ops.sub),
+            (torch.mul, operator.mul, ["aten.mul.default", "aten.mul.Tensor", "aten.mul.Scalar"], self.ops.mul),
+            (torch.div, operator.truediv, ["aten.div.default", "aten.div.Tensor", "aten.div.Scalar"], self.ops.div),
+            (torch.maximum, None, ["aten.maximum.default"], self.ops.maximum),
+            (torch.minimum, None, ["aten.minimum.default"], self.ops.minimum),
+            (torch.eq, operator.eq, ["aten.eq.default", "aten.eq.Tensor", "aten.eq.Scalar"], self.ops.eq),
+            (torch.ne, operator.ne, ["aten.ne.default", "aten.ne.Tensor", "aten.ne.Scalar"], self.ops.ne),
+            (torch.lt, operator.lt, ["aten.lt.default", "aten.lt.Tensor", "aten.lt.Scalar"], self.ops.lt),
+            (torch.le, operator.le, ["aten.le.default", "aten.le.Tensor", "aten.le.Scalar"], self.ops.le),
+            (torch.gt, operator.gt, ["aten.gt.default", "aten.gt.Tensor", "aten.gt.Scalar"], self.ops.gt),
+            (torch.ge, operator.ge, ["aten.ge.default", "aten.ge.Tensor", "aten.ge.Scalar"], self.ops.ge),
+            (torch.clamp_max, None, ["aten.clamp_max.default"], self.ops.clamp_max),
+            (torch.clamp_min, None, ["aten.clamp_min.default"], self.ops.clamp_min),
+            (torch.bitwise_and, operator.and_, ["aten.bitwise_and.default", "aten.bitwise_and.Tensor"], self.ops.bitwise_and),
         ]
         
-        for t, op, name, func in binary_ops:
+        for t, op, names, func in binary_ops:
             wrapper = self._wrap_binary(func)
             if t: m[t] = wrapper
             if op: m[op] = wrapper
-            if name: m[name] = wrapper
+            for name in names:
+                m[name] = wrapper
 
         m[torch.clamp] = self._wrap_clamp()
         m["aten.clamp.default"] = self._wrap_clamp()
@@ -92,6 +90,7 @@ class FXGraphTranslator:
 
         m["aten.slice.Tensor"] = self._wrap_slice()
         m["aten.select.int"] = self._wrap_select()
+        m["aten.split.Tensor"] = self._wrap_split()
         
         m[torch.squeeze] = self._wrap_squeeze()
         m["squeeze"] = self._wrap_squeeze()
@@ -134,6 +133,7 @@ class FXGraphTranslator:
         # Linear Algebra
         m[torch.mm] = self._wrap_binary(self.ops.mm)
         m["aten.mm.default"] = self._wrap_binary(self.ops.mm)
+        m["aten.addmm.default"] = self._wrap_addmm()
 
         # Convolution
         m[torch.convolution] = self._wrap_unsupported("aten.convolution")
@@ -153,6 +153,13 @@ class FXGraphTranslator:
         def convert(node: fx.Node):
             args = self.retrieve_args(node)
             return op_func(args[0], args[1])
+        return convert
+
+    def _wrap_addmm(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            bias, input, mat2 = args[:3]
+            return self.ops.add(self.ops.mm(input, mat2), bias)
         return convert
 
     def _wrap_unary(self, op_func):
@@ -307,6 +314,15 @@ class FXGraphTranslator:
             return self.ops.select(args[0], args[1], args[2])
         return convert
 
+    def _wrap_split(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            split_size_or_sections = args[1]
+            dim = args[2] if len(args) > 2 else node.kwargs.get("dim", 0)
+            return self.ops.split(x, split_size_or_sections, dim=dim)
+        return convert
+
     def _wrap_squeeze(self):
         def convert(node: fx.Node):
             args = self.retrieve_args(node)
@@ -368,31 +384,34 @@ class FXGraphTranslator:
         old_env = self.env
         old_sym_map = self.ops.sym_map
         self.env = {}
-        # Temporarily use dummy symbols for dry run if needed
-        # ...
         
         res_def = self.translate(graph, dummy_inputs)
         out_type = res_def.type()
         self.env = old_env
 
-        # 2. Create the closed function (Lambda)
-        dom = self.world.sigma(input_types)
-        lam = self.world.mut_lam(dom, out_type)
+        # 2. Create the closed CPS function (fun)
+        ret_cn_type = self.world.cn([out_type])
+        dom_with_ret = self.world.sigma(input_types + [ret_cn_type])
+        lam = self.world.mut_con(dom_with_ret)
         lam.set(name)
         
         # 3. Map lambda parameters to FX placeholders and get_attr nodes
-        all_params = [lam.var().proj(len(input_types), i) for i in range(len(input_types))]
+        num_params = len(input_types) + 1
+        all_params = [lam.var().proj(num_params, i) for i in range(num_params)]
         
         # Map symbols
         if sym_names:
             for i, n in enumerate(sym_names):
                 self.ops.sym_map[n] = all_params[i]
                 
-        actual_inputs = all_params[num_sym:]
+        actual_inputs = all_params[num_sym:-1]
+        ret_cont = all_params[-1]
         
         # 4. Perform actual translation
         result = self.translate(graph, actual_inputs)
-        lam.set_body(True, result)
+        
+        # Apply the return continuation to the result
+        lam.app(True, ret_cont, [result])
         
         # Externalize only after it's closed (body set)
         lam.externalize()
@@ -468,6 +487,10 @@ class FXGraphTranslator:
         if target in self.convert_map:
             return self.convert_map[target](node)
         
+        target_text = str(target)
+        if target_text in self.convert_map:
+            return self.convert_map[target_text](node)
+
         if isinstance(target, str) and target in self.convert_map:
              return self.convert_map[target](node)
 
