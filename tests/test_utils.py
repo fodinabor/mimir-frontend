@@ -11,7 +11,7 @@ class AddReluModel(torch.nn.Module):
 def test_model_to_mimir_outputs_high_level_tensor_ir():
     ir = model_to_mimir(
         AddReluModel(),
-        input_shapes=[(None,), (None,)],
+        input_shapes=[("n",), ("n",)],
         compile_phase="high_level",
     )
 
@@ -22,7 +22,7 @@ def test_model_to_mimir_outputs_high_level_tensor_ir():
 def test_model_to_mimir_can_use_default_compile_phase():
     ir = model_to_mimir(
         AddReluModel(),
-        input_shapes=[(None,), (None,)],
+        input_shapes=[("n",), ("n",)],
         compile_phase="default",
     )
 

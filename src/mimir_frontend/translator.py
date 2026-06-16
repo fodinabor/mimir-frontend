@@ -78,11 +78,35 @@ class FXGraphTranslator:
         m["prims.fma.default"] = self._wrap_fma()
 
         # Injective
-        m[torch.cat] = self._wrap_unsupported("aten.cat")
-        m["aten.cat.default"] = self._wrap_unsupported("aten.cat")
+        m[torch.cat] = self._wrap_cat()
+        m["aten.cat.default"] = self._wrap_cat()
         m[torch.permute] = self._wrap_transpose()
         m["aten.permute.default"] = self._wrap_transpose()
         m["t"] = self._wrap_t()
+        
+        m[torch.reshape] = self._wrap_reshape()
+        m["aten.reshape.default"] = self._wrap_reshape()
+        m["reshape"] = self._wrap_reshape()
+        m["view"] = self._wrap_reshape()
+        m["aten.view.default"] = self._wrap_reshape()
+
+        m["aten.slice.Tensor"] = self._wrap_slice()
+        m["aten.select.int"] = self._wrap_select()
+        
+        m[torch.squeeze] = self._wrap_squeeze()
+        m["squeeze"] = self._wrap_squeeze()
+        m["aten.squeeze.dim"] = self._wrap_squeeze()
+        m["aten.squeeze.dims"] = self._wrap_squeeze()
+        
+        m[torch.unsqueeze] = self._wrap_unsqueeze()
+        m["unsqueeze"] = self._wrap_unsqueeze()
+        m["aten.unsqueeze.default"] = self._wrap_unsqueeze()
+
+        m[torch.clone] = self._wrap_unary(self.ops.clone)
+        m["clone"] = self._wrap_unary(self.ops.clone)
+        m["aten.clone.default"] = self._wrap_unary(self.ops.clone)
+        m["aten.copy.default"] = self._wrap_binary(self.ops.copy)
+        m["aten.lift_fresh_copy.default"] = self._wrap_unary(self.ops.clone)
         
         # Broadcast
         m[torch.expand_copy] = self._wrap_expand()
@@ -187,9 +211,31 @@ class FXGraphTranslator:
     def _wrap_getitem(self):
         def convert(node: fx.Node):
             args = self.retrieve_args(node)
-            tup = args[0]
+            obj = args[0]
             index = args[1]
-            return tup.proj(tup.num_projs(), index)
+            
+            # Check if obj is a tensor by inspecting its type
+            ty = obj.type()
+            
+            if isinstance(ty, (mim.Arr, mim.Seq)):
+                # Handle tensor indexing/slicing
+                if isinstance(index, int):
+                    return self.ops.select(obj, 0, index)
+                elif isinstance(index, slice):
+                    return self.ops.slice(obj, 0, index.start or 0, index.stop, index.step or 1)
+                elif isinstance(index, (tuple, list)):
+                    res = obj
+                    for i, idx in enumerate(index):
+                        if isinstance(idx, slice):
+                            res = self.ops.slice(res, i, idx.start or 0, idx.stop, idx.step or 1)
+                        elif isinstance(idx, int):
+                            res = self.ops.select(res, i, idx)
+                    return res
+            
+            # Fallback to tuple projection
+            if isinstance(index, int):
+                return obj.proj(obj.num_projs(), index)
+            raise TypeError(f"Cannot getitem from {obj} (mim_type {type(ty)}) with index {index} (type {type(index)})")
         return convert
 
     def _wrap_getattr(self):
@@ -232,6 +278,55 @@ class FXGraphTranslator:
             x = args[0]
             shape = args[1:] if len(args) > 2 else args[1]
             return self.ops.expand(x, shape)
+        return convert
+
+    def _wrap_reshape(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            shape = args[1:] if len(args) > 2 else args[1]
+            return self.ops.reshape(x, shape)
+        return convert
+
+    def _wrap_slice(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            # aten.slice.Tensor(input, dim=0, start=0, end=9223372036854775807, step=1)
+            x = args[0]
+            dim = args[1] if len(args) > 1 else 0
+            start = args[2] if len(args) > 2 else 0
+            end = args[3] if len(args) > 3 else None
+            step = args[4] if len(args) > 4 else 1
+            return self.ops.slice(x, dim, start, end, step)
+        return convert
+
+    def _wrap_select(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            # aten.select.int(input, dim, index)
+            return self.ops.select(args[0], args[1], args[2])
+        return convert
+
+    def _wrap_squeeze(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            dim = args[1] if len(args) > 1 else None
+            return self.ops.squeeze(x, dim)
+        return convert
+
+    def _wrap_unsqueeze(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            return self.ops.unsqueeze(args[0], args[1])
+        return convert
+
+    def _wrap_cat(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            tensors = args[0]
+            dim = args[1] if len(args) > 1 else node.kwargs.get("dim", 0)
+            return self.ops.cat(self.world.tuple(tensors), dim=dim)
         return convert
 
     def _wrap_full(self):
@@ -373,14 +468,14 @@ class FXGraphTranslator:
         if target in self.convert_map:
             return self.convert_map[target](node)
         
+        if isinstance(target, str) and target in self.convert_map:
+             return self.convert_map[target](node)
+
         if hasattr(target, "name"):
             name = target.name()
             name = name.replace("::", ".")
             if name in self.convert_map:
                 return self.convert_map[name](node)
-
-        if node.op == "call_method" and target in self.convert_map:
-             return self.convert_map[target](node)
         
         raise NotImplementedError(f"Target {target} (type {type(target)}) not supported")
 

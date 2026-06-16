@@ -408,3 +408,76 @@ def test_expand_operator(shape_kind):
     result = translate_model(Model(), [x_input])
     assert isinstance(result, mim.Def)
     assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
+
+def test_reshape_operator():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return x.reshape(2, 5, 20, 30)
+
+    world = make_world()
+    x_input, = make_inputs(world, 1, "static", 3) # (10, 20, 30)
+    result = translate_model(Model(), [x_input])
+    assert isinstance(result, mim.Def)
+    ir = def_to_string(result)
+    assert "%tensor.reshape" in ir
+
+def test_slice_operator():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return x[2:5, :, 10:20]
+
+    world = make_world()
+    x_input, = make_inputs(world, 1, "static", 3) # (10, 20, 30)
+    result = translate_model(Model(), [x_input])
+    assert isinstance(result, mim.Def)
+    ir = def_to_string(result)
+    assert "%tensor.slice" in ir
+
+def test_cat_operator():
+    class Model(torch.nn.Module):
+        def forward(self, x, y):
+            return torch.cat([x, y], dim=1)
+
+    world = make_world()
+    x_input, y_input = make_inputs(world, 2, "static", 3)
+    result = translate_model(Model(), [x_input, y_input])
+    assert isinstance(result, mim.Def)
+    ir = def_to_string(result)
+    assert "%tensor.concat" in ir
+
+def test_squeeze_unsqueeze_operator():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            y = x.unsqueeze(1) # (10, 1, 20, 30)
+            return y.squeeze(1)
+
+    world = make_world()
+    x_input, = make_inputs(world, 1, "static", 3)
+    result = translate_model(Model(), [x_input])
+    assert isinstance(result, mim.Def)
+    ir = def_to_string(result)
+    assert "%tensor.reshape" in ir
+
+def test_select_operator():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return x[5] # selects index 5 along dim 0
+
+    world = make_world()
+    x_input, = make_inputs(world, 1, "static", 3)
+    result = translate_model(Model(), [x_input])
+    assert isinstance(result, mim.Def)
+    # select is implemented as slice + squeeze(reshape)
+    # Note: MimIR may normalize singleton dimensions away, making squeeze a no-op type-wise.
+    ir = def_to_string(result)
+    assert "%tensor.slice" in ir
+
+def test_clone_copy_operator():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return x.clone()
+
+    world = make_world()
+    x_input, = make_inputs(world, 1, "static", 3)
+    result = translate_model(Model(), [x_input])
+    assert result == x_input # identity
