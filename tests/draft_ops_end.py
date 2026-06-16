@@ -2,8 +2,7 @@
     def mm(self, lhs, rhs):
         # Ring: [T: *, _0: T, add: [T, T] -> T, mul: [T, T] -> T]
         ring = self.world.tuple([self.F32, self._f32_float_lit(0.0), self.f32_add_axm, self.f32_mul_axm])
-        # 0x5463d44130001300 is product_2d
-        callee = self.world.annex(0x5463d44130001300)
+        callee = self.world.annex(tensor.product_2d.value)
         callee = self.world.app(callee, ring)
         return self.world.implicit_app(callee, [lhs, rhs])
 

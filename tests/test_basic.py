@@ -25,7 +25,7 @@ def make_tensor_type(world, elem_type, shape_kind, rank):
 
     if rank == 1:
         return world.arr(world.lit_nat(8), elem_type)
-    shape = world.tuple([world.lit_nat(2), world.lit_nat(3), world.lit_nat(4)])
+    shape = world.tuple([world.lit_nat(i + 2) for i in range(rank)])
     return world.arr(shape, elem_type)
 
 
@@ -33,6 +33,20 @@ def make_inputs(world, count, shape_kind, rank):
     ops = FXGraphTranslator(world).ops
     tensor_ty = make_tensor_type(world, ops.F32, shape_kind, rank)
     return [world.mut_con(tensor_ty).var() for _ in range(count)]
+
+
+def make_static_inputs_with_shapes(world, shapes, elem_type=None):
+    ops = FXGraphTranslator(world).ops
+    if elem_type is None:
+        elem_type = ops.F32
+    inputs = []
+    for shape in shapes:
+        if len(shape) == 1:
+            tensor_ty = world.arr(world.lit_nat(shape[0]), elem_type)
+        else:
+            tensor_ty = world.arr(world.tuple([world.lit_nat(dim) for dim in shape]), elem_type)
+        inputs.append(world.mut_con(tensor_ty).var())
+    return inputs
 
 
 def translate_model(model, inputs):
@@ -46,6 +60,14 @@ def def_to_string(defn):
         path = Path(tmp_dir) / "def.mim"
         defn.write(100, str(path))
         return path.read_text()
+
+
+def assert_ir_contains_in_order(ir, expected):
+    cursor = 0
+    for needle in expected:
+        index = ir.find(needle, cursor)
+        assert index >= 0, f"expected {needle!r} after offset {cursor}\nIR:\n{ir}"
+        cursor = index + len(needle)
 
 
 def assert_translates_for_all_shapes(model_factory, input_count):
@@ -70,6 +92,13 @@ def tensor_shape(tensor_def):
         dims.append(tensor_type.arity())
         tensor_type = tensor_type.body()
     return dims
+
+
+def tensor_shape_values(tensor_def):
+    values = []
+    for dim in tensor_shape(tensor_def):
+        values.append(dim.get_nat() if isinstance(dim, mim.Lit) else None)
+    return values
 
 
 def assert_translates_to_element_type_for_all_shapes(model_factory, input_count, element_type_fn):
@@ -178,6 +207,32 @@ def test_sequence_of_elementwise_operators(shape_kind, rank):
     result = translate_model(Model(), make_inputs(world, 3, shape_kind, rank))
 
     assert isinstance(result, mim.Def)
+    assert_ir_contains_in_order(def_to_string(result), ["%tensor.binary", "%tensor.binary", "%tensor.unary"])
+
+
+def test_binary_broadcast_leading_singleton_uses_common_output_shape():
+    class Model(torch.nn.Module):
+        def forward(self, x, y):
+            return x + y
+
+    world = make_world()
+    x_input, y_input = make_static_inputs_with_shapes(world, [(2, 3, 4), (1, 3, 4)])
+    result = translate_model(Model(), [x_input, y_input])
+
+    assert tensor_shape_values(result) == [2, 3, 4]
+    assert_ir_contains_in_order(def_to_string(result), ["%tensor.broadcast_in_dim", "%tensor.binary"])
+
+
+def test_binary_broadcast_rejects_incompatible_static_shape():
+    class Model(torch.nn.Module):
+        def forward(self, x, y):
+            return x + y
+
+    world = make_world()
+    x_input, y_input = make_static_inputs_with_shapes(world, [(2, 3, 4), (5,)])
+
+    with pytest.raises(NotImplementedError, match="broadcast"):
+        translate_model(Model(), [x_input, y_input])
 
 
 @pytest.mark.parametrize(
@@ -284,6 +339,7 @@ def test_where_operator(shape_kind, rank):
     result = translate_model(Model(), [cond_input, x_input, y_input])
     assert isinstance(result, mim.Def)
     assert tensor_element_type(result) == ops.F32
+    assert "%tensor.select" in def_to_string(result)
 
 @pytest.mark.parametrize("shape_kind", ["static", "dynamic"])
 @pytest.mark.parametrize("rank", [1, 3])
@@ -419,7 +475,7 @@ def test_reshape_operator():
     result = translate_model(Model(), [x_input])
     assert isinstance(result, mim.Def)
     ir = def_to_string(result)
-    assert "%tensor.reshape" in ir
+    assert_ir_contains_in_order(ir, ["%tensor.reshape"])
 
 def test_slice_operator():
     class Model(torch.nn.Module):
@@ -431,7 +487,7 @@ def test_slice_operator():
     result = translate_model(Model(), [x_input])
     assert isinstance(result, mim.Def)
     ir = def_to_string(result)
-    assert "%tensor.slice" in ir
+    assert_ir_contains_in_order(ir, ["%tensor.slice"])
 
 def test_cat_operator():
     class Model(torch.nn.Module):

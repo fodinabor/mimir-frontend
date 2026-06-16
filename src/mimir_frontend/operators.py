@@ -87,6 +87,54 @@ class OperatorLibrary:
             
         return dims
 
+    def _dim_literal_value(self, dim):
+        if isinstance(dim, mim.Lit) and hasattr(dim, "get_nat"):
+            return dim.get_nat()
+        return None
+
+    def _is_dim_one(self, dim):
+        return self._dim_literal_value(dim) == 1
+
+    def _same_dim(self, lhs, rhs):
+        lhs_value = self._dim_literal_value(lhs)
+        rhs_value = self._dim_literal_value(rhs)
+        if lhs_value is not None and rhs_value is not None:
+            return lhs_value == rhs_value
+        return lhs == rhs
+
+    def _same_shape_dims(self, lhs_dims, rhs_dims):
+        return len(lhs_dims) == len(rhs_dims) and all(
+            self._same_dim(lhs_dim, rhs_dim)
+            for lhs_dim, rhs_dim in zip(lhs_dims, rhs_dims)
+        )
+
+    def _broadcast_dim(self, lhs_dim, rhs_dim):
+        if self._same_dim(lhs_dim, rhs_dim):
+            return lhs_dim
+        if self._is_dim_one(lhs_dim):
+            return rhs_dim
+        if self._is_dim_one(rhs_dim):
+            return lhs_dim
+
+        lhs_value = self._dim_literal_value(lhs_dim)
+        rhs_value = self._dim_literal_value(rhs_dim)
+        if lhs_value is not None and rhs_value is not None:
+            raise NotImplementedError(
+                f"broadcast incompatible dimensions: {lhs_value} vs {rhs_value}"
+            )
+
+        # Symbolic dimensions may be equal at runtime. Keep the left-hand dim
+        # instead of rejecting dynamic-shape models prematurely.
+        return lhs_dim
+
+    def _broadcast_shape_dims(self, lhs_dims, rhs_dims):
+        out_reversed = []
+        for offset in range(1, max(len(lhs_dims), len(rhs_dims)) + 1):
+            lhs_dim = lhs_dims[-offset] if offset <= len(lhs_dims) else self.world.lit_nat(1)
+            rhs_dim = rhs_dims[-offset] if offset <= len(rhs_dims) else self.world.lit_nat(1)
+            out_reversed.append(self._broadcast_dim(lhs_dim, rhs_dim))
+        return list(reversed(out_reversed))
+
     def _apply_grouped(self, callee, args):
         return self.world.app(callee, self.world.tuple(args))
 
@@ -150,20 +198,17 @@ class OperatorLibrary:
         if out_type is None:
             out_type = in_type
             
-        # Broadcasting logic
         s_lhs_dims = self._shape_dims(lhs)
         s_rhs_dims = self._shape_dims(rhs)
+        output_dims = self._broadcast_shape_dims(s_lhs_dims, s_rhs_dims)
         
-        if len(s_lhs_dims) != len(s_rhs_dims) or any(d1 != d2 for d1, d2 in zip(s_lhs_dims, s_rhs_dims)):
-            if len(s_lhs_dims) > len(s_rhs_dims):
-                rhs = self.expand(rhs, s_lhs_dims)
-            elif len(s_rhs_dims) > len(s_lhs_dims):
-                lhs = self.expand(lhs, s_rhs_dims)
-            else:
-                # Same rank but different dims (e.g. 1s)
-                rhs = self.expand(rhs, s_lhs_dims)
+        if not self._same_shape_dims(s_lhs_dims, output_dims):
+            lhs = self.expand(lhs, output_dims)
+        if not self._same_shape_dims(s_rhs_dims, output_dims):
+            rhs = self.expand(rhs, output_dims)
 
-        rank, shape = self._rank_and_shape(lhs)
+        rank = self.world.lit_nat(len(output_dims))
+        shape = self.world.tuple(output_dims)
         callee = self.world.annex(tensor.binary.value)
         callee = self._apply_grouped(callee, [in_type, in_type, out_type])
         callee = self.world.app(callee, op)
@@ -322,8 +367,7 @@ class OperatorLibrary:
             tensor_type = tensor_type.body()
         
         rank, shape = self._rank_and_shape(x)
-        # 0x5463d44130002100 is tensor.select ID
-        callee = self.world.annex(0x5463d44130002100)
+        callee = self.world.annex(tensor.select.value)
         callee = self.world.app(callee, tensor_type)
         callee = self._apply_grouped(callee, [rank, shape])
         return self._apply_grouped(callee, [cond, x, y])
@@ -347,8 +391,7 @@ class OperatorLibrary:
         out_shape_tuple, out_rank_val = self._extract_shape(shape)
         out_rank = self.world.lit_nat(out_rank_val)
         
-        # Check if already same shape
-        if in_rank_val == out_rank_val and in_shape == out_shape_tuple:
+        if self._same_shape_dims(in_dims, list(shape)):
             return input
 
         elem_type = self._tensor_element_type(input)
@@ -559,8 +602,7 @@ class OperatorLibrary:
     def mm(self, lhs, rhs):
         # Ring: [T: *, _0: T, add: [T, T] -> T, mul: [T, T] -> T]
         ring = self.world.tuple([self.F32, self._f32_float_lit(0.0), self.f32_add_axm, self.f32_mul_axm])
-        # 0x5463d44130001300 is product_2d
-        callee = self.world.annex(0x5463d44130001300)
+        callee = self.world.annex(tensor.product_2d.value)
         callee = self.world.app(callee, ring)
         return self.world.implicit_app(callee, [lhs, rhs])
 
