@@ -13,6 +13,7 @@ class OperatorLibrary:
         self.Bool = world.type_bool()
         self.mode0 = world.lit_nat_0()
         self.sym_map = {} # Mapping from symbolic name to MimIR Nat variable
+        self._shape_cache = {}
 
         
         def bind_math_axm(axm_enum):
@@ -70,12 +71,27 @@ class OperatorLibrary:
 
     def shape_of(self, value):
         if isinstance(value, mim.Def):
+            cached = self._shape_cache.get(id(value))
+            if cached is not None:
+                return list(cached)
+        if isinstance(value, mim.Def):
             return self._shape_dims(value)
         if hasattr(value, "meta") and isinstance(value.meta, dict) and "val" in value.meta:
             return self.shape_of(value.meta["val"])
         if hasattr(value, "shape"):
             return list(value.shape)
         raise TypeError(f"shape_of does not support {type(value)}")
+
+    def _remember_shape(self, value, dims):
+        if isinstance(value, mim.Def):
+            normalized = []
+            for dim in dims:
+                if isinstance(dim, int):
+                    normalized.append(self.world.lit_nat(dim))
+                else:
+                    normalized.append(dim)
+            self._shape_cache[id(value)] = normalized
+        return value
 
     def _shape_dims(self, tensor_def):
         dims = []
@@ -211,7 +227,8 @@ class OperatorLibrary:
         callee = self._apply_grouped(callee, [in_type, in_type, out_type])
         callee = self.world.app(callee, op)
         callee = self._apply_grouped(callee, [rank, shape])
-        return self.world.app(callee, [lhs, rhs])
+        result = self.world.app(callee, [lhs, rhs])
+        return self._remember_shape(result, output_dims)
 
     def compare(self, op, lhs, rhs):
         return self.binary(op, lhs, rhs, out_type=self.Bool)
@@ -221,14 +238,25 @@ class OperatorLibrary:
         if out_type is None:
             out_type = in_type
         rank, shape = self._rank_and_shape(input)
-        return self._unary_with_types(in_type, out_type, op, input, rank, shape)
+        return self._unary_with_types(
+            in_type,
+            out_type,
+            op,
+            input,
+            rank,
+            shape,
+            shape_dims=self.shape_of(input),
+        )
 
-    def _unary_with_types(self, input_type, output_type, op, input, rank, shape):
+    def _unary_with_types(self, input_type, output_type, op, input, rank, shape, shape_dims=None):
         callee = self.world.annex(tensor.unary.value)
         callee = self._apply_grouped(callee, [input_type, output_type])
         callee = self.world.app(callee, op)
         callee = self._apply_grouped(callee, [rank, shape])
-        return self.world.app(callee, input)
+        result = self.world.app(callee, input)
+        if shape_dims is not None:
+            self._remember_shape(result, shape_dims)
+        return result
 
     def _f32_float_lit(self, value):
         bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
@@ -378,7 +406,8 @@ class OperatorLibrary:
         callee = self.world.annex(tensor.select.value)
         callee = self.world.app(callee, tensor_type)
         callee = self._apply_grouped(callee, [rank, shape])
-        return self._apply_grouped(callee, [cond, x, y])
+        result = self._apply_grouped(callee, [cond, x, y])
+        return self._remember_shape(result, output_dims)
 
     def _extract_shape(self, shape_arg):
         out_shape_list = []
@@ -427,12 +456,14 @@ class OperatorLibrary:
             lam.set_body(True, input)
             callee = self.world.app(callee, lam)
             callee = self.world.app(callee, self.world.tuple([out_rank, out_shape_tuple]))
-            return self.world.app(callee, self.world.tuple([]))
+            result = self.world.app(callee, self.world.tuple([]))
+            return self._remember_shape(result, shape)
 
         if in_rank_val == out_rank_val:
             callee = self.world.annex(tensor.broadcast.value)
             callee = self._apply_grouped(callee, [elem_type, out_rank])
-            return self.world.app(callee, [in_shape, out_shape_tuple, input])
+            result = self.world.app(callee, [in_shape, out_shape_tuple, input])
+            return self._remember_shape(result, shape)
         else:
             callee = self.world.annex(tensor.broadcast_in_dim.value)
             callee = self._apply_grouped(callee, [elem_type, in_rank, out_rank])
@@ -442,7 +473,8 @@ class OperatorLibrary:
             index_mapping = [self.world.lit(idx_t, offset + i) for i in range(in_rank_val)]
             index_tuple = self.world.tuple(index_mapping)
             
-            return self.world.app(callee, [in_shape, out_shape_tuple, input, index_tuple])
+            result = self.world.app(callee, [in_shape, out_shape_tuple, input, index_tuple])
+            return self._remember_shape(result, shape)
 
     def full(self, shape, fill_value, dtype=None):
         import torch
@@ -473,7 +505,8 @@ class OperatorLibrary:
         callee = self.world.app(callee, self.world.tuple([out_rank, out_shape]))
         
         input_is = self.world.tuple([])
-        return self.world.app(callee, input_is)
+        result = self.world.app(callee, input_is)
+        return self._remember_shape(result, shape)
 
     def _reduce_aff(self, input, output_type, reducer, init, dim=None, keepdim=False, return_shape=False):
         input_dims = self.shape_of(input)
@@ -531,6 +564,7 @@ class OperatorLibrary:
             ),
         )
         result = self.world.app(callee, self.world.tuple([input]))
+        self._remember_shape(result, output_dims)
         if return_shape:
             return result, output_dims
         return result
@@ -565,7 +599,15 @@ class OperatorLibrary:
         )
         rank = self.world.lit_nat(len(output_dims))
         shape = self.world.tuple(output_dims)
-        return self._unary_with_types(pair_type, self.F32, self._f32_pair_to_mean_lambda(pair_type), reduced, rank, shape)
+        return self._unary_with_types(
+            pair_type,
+            self.F32,
+            self._f32_pair_to_mean_lambda(pair_type),
+            reduced,
+            rank,
+            shape,
+            shape_dims=output_dims,
+        )
 
     def _f32_var_mean_reduce_lambda(self, acc_type):
         """
@@ -646,8 +688,24 @@ class OperatorLibrary:
         rank = self.world.lit_nat(len(output_dims))
         shape = self.world.tuple(output_dims)
         
-        var_tensor = self._unary_with_types(acc_type, self.F32, self._f32_acc_to_var_mean(acc_type, extract_var=True), reduced, rank, shape)
-        mean_tensor = self._unary_with_types(acc_type, self.F32, self._f32_acc_to_var_mean(acc_type, extract_var=False), reduced, rank, shape)
+        var_tensor = self._unary_with_types(
+            acc_type,
+            self.F32,
+            self._f32_acc_to_var_mean(acc_type, extract_var=True),
+            reduced,
+            rank,
+            shape,
+            shape_dims=output_dims,
+        )
+        mean_tensor = self._unary_with_types(
+            acc_type,
+            self.F32,
+            self._f32_acc_to_var_mean(acc_type, extract_var=False),
+            reduced,
+            rank,
+            shape,
+            shape_dims=output_dims,
+        )
         
         return self.world.tuple([var_tensor, mean_tensor])
 
@@ -674,7 +732,8 @@ class OperatorLibrary:
         callee = self._apply_grouped(callee, [elem_t, in_rank, out_rank])
         callee = self.world.app(callee, in_shape)
         callee = self.world.app(callee, out_shape_tuple)
-        return self.world.app(callee, x)
+        result = self.world.app(callee, x)
+        return self._remember_shape(result, list(shape))
 
     def view(self, x, shape):
         return self.reshape(x, shape)
@@ -729,7 +788,8 @@ class OperatorLibrary:
             self.world.tuple(steps),
             self.world.tuple(out_dims)
         ]))
-        return self.world.app(callee, x)
+        result = self.world.app(callee, x)
+        return self._remember_shape(result, out_dims)
 
     def cat(self, tensors, dim=0):
         num_inputs = tensors.num_projs()
@@ -753,7 +813,8 @@ class OperatorLibrary:
             input_shapes.append(s)
         
         callee = self.world.app(callee, self.world.tuple(input_shapes))
-        return self.world.app(callee, tensors)
+        result = self.world.app(callee, tensors)
+        return result
 
     def transpose(self, x, permutation):
         rank, shape = self._rank_and_shape(x)
@@ -763,7 +824,9 @@ class OperatorLibrary:
         
         callee = self.world.annex(tensor.transpose.value)
         callee = self._apply_grouped(callee, [elem_t, rank, shape])
-        return self.world.app(callee, [x, perm_mim])
+        result = self.world.app(callee, [x, perm_mim])
+        out_dims = [self.shape_of(x)[p] for p in permutation]
+        return self._remember_shape(result, out_dims)
 
     def _is_one(self, d):
         if isinstance(d, int): return d == 1

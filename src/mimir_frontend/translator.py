@@ -484,29 +484,29 @@ class FXGraphTranslator:
                 raise NotImplementedError(f"Op {node.op} not implemented")
 
 
-    def _convert_tensor_constant(self, tensor: torch.Tensor) -> mim.Def:
-        # For now, let's treat weights as placeholders too, or real constants?
-        # If we want a completely closed module, we should embed them or pass them as args.
-        # Passing as args is cleaner for now.
-        # But if they are get_attr, they are already in the graph.
+    # def _convert_tensor_constant(self, tensor: torch.Tensor) -> mim.Def:
+    #     # For now, let's treat weights as placeholders too, or real constants?
+    #     # If we want a completely closed module, we should embed them or pass them as args.
+    #     # Passing as args is cleaner for now.
+    #     # But if they are get_attr, they are already in the graph.
         
-        # Simple strategy: Create a MimIR constant array if it's small, 
-        # or just a placeholder-like mutable if it's large.
-        # Given the requirement for a "mimir_module", maybe we should let the user
-        # decide which parameters become arguments.
+    #     # Simple strategy: Create a MimIR constant array if it's small, 
+    #     # or just a placeholder-like mutable if it's large.
+    #     # Given the requirement for a "mimir_module", maybe we should let the user
+    #     # decide which parameters become arguments.
         
-        # For now, let's just create a mutable with the right type.
-        shape = list(tensor.shape)
-        dtype = tensor.dtype
-        if dtype == torch.float32:
-            elem_t = self.ops.F32
-        elif dtype == torch.bool:
-            elem_t = self.ops.Bool
-        else:
-            raise NotImplementedError(f"Tensor constant with dtype {dtype} not supported")
+    #     # For now, let's just create a mutable with the right type.
+    #     shape = list(tensor.shape)
+    #     dtype = tensor.dtype
+    #     if dtype == torch.float32:
+    #         elem_t = self.ops.F32
+    #     elif dtype == torch.bool:
+    #         elem_t = self.ops.Bool
+    #     else:
+    #         raise NotImplementedError(f"Tensor constant with dtype {dtype} not supported")
             
-        mim_shape = self.world.tuple([self.world.lit_nat(d) for d in shape])
-        return self.world.mut_con(self.world.arr(mim_shape, elem_t)).var()
+    #     mim_shape = self.world.tuple([self.world.lit_nat(d) for d in shape])
+    #     return self.world.mut_con(self.world.arr(mim_shape, elem_t)).var()
 
 
     def convert_node(self, node: fx.Node) -> mim.Def:

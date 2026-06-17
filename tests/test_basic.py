@@ -1,3 +1,4 @@
+from typing import List
 import pytest
 import mim
 import operator
@@ -10,13 +11,13 @@ import tempfile
 from mimir_frontend.translator import FXGraphTranslator
 
 
-def make_world():
+def make_world() -> mim.World:
     driver = mim.Driver()
     driver.load_plugins(["math", "tensor", "affine"])
     return driver.world()
 
 
-def make_tensor_type(world, elem_type, shape_kind, rank):
+def make_tensor_type(world: mim.World, elem_type, shape_kind, rank) -> mim.Def:
     if shape_kind == "dynamic":
         dims = [world.mut_con(world.type_nat()).var() for _ in range(rank)]
         if rank == 1:
@@ -29,13 +30,13 @@ def make_tensor_type(world, elem_type, shape_kind, rank):
     return world.arr(shape, elem_type)
 
 
-def make_inputs(world, count, shape_kind, rank):
+def make_inputs(world: mim.World, count, shape_kind, rank) -> List[mim.Def]:
     ops = FXGraphTranslator(world).ops
     tensor_ty = make_tensor_type(world, ops.F32, shape_kind, rank)
     return [world.mut_con(tensor_ty).var() for _ in range(count)]
 
 
-def make_static_inputs_with_shapes(world, shapes, elem_type=None):
+def make_static_inputs_with_shapes(world: mim.World, shapes, elem_type=None) -> List[mim.Def]:
     ops = FXGraphTranslator(world).ops
     if elem_type is None:
         elem_type = ops.F32
@@ -85,7 +86,7 @@ def tensor_element_type(tensor_def):
     return tensor_type
 
 
-def tensor_shape(tensor_def):
+def tensor_shape(tensor_def: mim.Def):
     dims = []
     tensor_type = tensor_def.type()
     while isinstance(tensor_type, mim.Seq):
@@ -94,14 +95,14 @@ def tensor_shape(tensor_def):
     return dims
 
 
-def tensor_shape_values(tensor_def):
+def tensor_shape_values(tensor_def: mim.Def):
     values = []
     for dim in tensor_shape(tensor_def):
         values.append(dim.get_nat() if isinstance(dim, mim.Lit) else None)
     return values
 
 
-def make_symbolic_tensor_input(world, dims, elem_type=None):
+def make_symbolic_tensor_input(world: mim.World, dims, elem_type=None):
     ops = FXGraphTranslator(world).ops
     if elem_type is None:
         elem_type = ops.F32
@@ -174,6 +175,73 @@ def test_shape_of_reads_symbolic_dims_from_mim_def_type():
     x = make_symbolic_tensor_input(world, dims)
 
     assert translator.ops.shape_of(x) == dims
+
+
+def test_same_dim_accepts_equal_literal_dims():
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+
+    assert ops._same_dim(world.lit_nat(7), world.lit_nat(7))
+
+
+def test_same_dim_accepts_same_symbol_def():
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    n = world.mut_con(world.type_nat()).var()
+
+    assert ops._same_dim(n, n)
+
+
+def test_same_dim_rejects_distinct_symbol_defs():
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    n = world.mut_con(world.type_nat()).var()
+    m = world.mut_con(world.type_nat()).var()
+
+    assert not ops._same_dim(n, m)
+
+
+def test_same_dim_rejects_symbol_and_top_nat():
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    n = world.mut_con(world.type_nat()).var()
+
+    assert not ops._same_dim(n, world.top_nat())
+
+
+def test_same_shape_dims_accepts_shared_symbolic_shape():
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    n = world.mut_con(world.type_nat()).var()
+    m = world.mut_con(world.type_nat()).var()
+
+    assert ops._same_shape_dims([n, m], [n, m])
+
+
+def test_broadcast_dim_keeps_lhs_for_distinct_symbolic_dims():
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    n = world.mut_con(world.type_nat()).var()
+    m = world.mut_con(world.type_nat()).var()
+
+    assert ops._broadcast_dim(n, m) == n
+
+
+def test_broadcast_binary_with_same_symbol_def_does_not_insert_expand():
+    class Model(torch.nn.Module):
+        def forward(self, x, y):
+            return x + y
+
+    world = make_world()
+    n = world.mut_con(world.type_nat()).var()
+    x = make_symbolic_tensor_input(world, [n, world.lit_nat(4)])
+    y = make_symbolic_tensor_input(world, [n, world.lit_nat(4)])
+
+    result = translate_model(Model(), [x, y])
+
+    assert tensor_shape(result) == [n, world.lit_nat(4)]
+    assert "%tensor.broadcast" not in def_to_string(result)
+
 
 
 def test_binary_operator_uses_tensor_type_shape_without_input_sym_names():
