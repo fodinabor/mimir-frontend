@@ -16,6 +16,97 @@ from .translator import FXGraphTranslator
 Shape = Sequence[int | str | None]
 
 
+class ShapeEnv:
+    def __init__(self, world: mim.World):
+        self.world = world
+        self._symbol_defs: dict[str, mim.Def] = {}
+        self.symbol_names: list[str] = []
+
+    def _register_symbol(self, name: str) -> str:
+        if name not in self._symbol_defs:
+            self.symbol_names.append(name)
+            self._symbol_defs[name] = self.world.mut_con(self.world.type_nat()).var()
+        return name
+
+    def normalize_dim(self, dim) -> int | str:
+        if isinstance(dim, int):
+            return dim
+        if dim is None:
+            return self._register_symbol(f"n{len(self.symbol_names)}")
+
+        text = str(dim)
+        if text.isdecimal():
+            return int(text)
+        return self._register_symbol(text)
+
+    def normalize_shape(self, shape: Shape) -> tuple[int | str, ...]:
+        return tuple(self.normalize_dim(dim) for dim in shape)
+
+    def symbol_def(self, name: str) -> mim.Def:
+        return self._symbol_defs[self._register_symbol(name)]
+
+
+def _shape_from_meta_value(value) -> tuple[int | str, ...]:
+    if not hasattr(value, "shape"):
+        raise TypeError(f"meta['val'] does not have shape: {type(value)}")
+    dims = []
+    for dim in value.shape:
+        dims.append(dim if isinstance(dim, int) else str(dim))
+    return tuple(dims)
+
+
+def shape_to_mimir_dims(
+    world: mim.World,
+    shape: Shape,
+    *,
+    shape_env: ShapeEnv | None = None,
+    symbolic: bool = False,
+) -> list[mim.Def]:
+    dims = []
+    for dim in shape:
+        if isinstance(dim, int):
+            dims.append(world.lit_nat(dim))
+        elif isinstance(dim, str):
+            if dim.isdecimal():
+                dims.append(world.lit_nat(int(dim)))
+            elif symbolic:
+                if shape_env is None:
+                    raise ValueError("shape_env is required when symbolic=True")
+                dims.append(shape_env.symbol_def(dim))
+            else:
+                dims.append(world.top_nat())
+        else:
+            dims.append(world.top_nat())
+    return dims
+
+
+def tensor_type_from_shape(
+    world: mim.World,
+    elem_type: mim.Def,
+    shape: Shape,
+    *,
+    shape_env: ShapeEnv | None = None,
+    symbolic: bool = False,
+) -> mim.Def:
+    dims = shape_to_mimir_dims(world, shape, shape_env=shape_env, symbolic=symbolic)
+    if not dims:
+        return elem_type
+    if len(dims) == 1:
+        return world.arr(dims[0], elem_type)
+    return world.arr(world.tuple(dims), elem_type)
+
+
+def _infer_input_shapes_from_placeholders(graph: fx.Graph) -> list[Shape]:
+    shapes = []
+    for node in graph.nodes:
+        if node.op != "placeholder":
+            continue
+        if "val" not in node.meta:
+            raise ValueError(f"placeholder {node.name} is missing meta['val']; provide input_shapes explicitly")
+        shapes.append(_shape_from_meta_value(node.meta["val"]))
+    return shapes
+
+
 def _make_driver(compile_phase: str) -> mim.Driver:
     driver = mim.Driver()
     plugins = ["math", "tensor"]
@@ -44,8 +135,8 @@ def _write_def_to_string(defn: mim.Def, name: str, max_depth: int) -> str:
 
 
 def model_to_mimir(
-    model: torch.nn.Module,
-    input_shapes: Sequence[Shape],
+    model: torch.nn.Module | fx.GraphModule,
+    input_shapes: Sequence[Shape] | None,
     *,
     compile_phase: str = "high_level",
     name: str = "mimir_module",
@@ -63,9 +154,14 @@ def model_to_mimir(
     driver = _make_driver(compile_phase)
     world = driver.world()
     
-    # Pre-trace to identify parameters used in the graph
-    traced = fx.symbolic_trace(model)
+    if isinstance(model, fx.GraphModule):
+        traced = model
+    else:
+        traced = fx.symbolic_trace(model)
     graph = traced.graph
+
+    if input_shapes is None:
+        input_shapes = _infer_input_shapes_from_placeholders(graph)
     
     # Identify parameters used in get_attr nodes
     param_nodes = [node for node in graph.nodes if node.op == "get_attr"]
@@ -74,23 +170,13 @@ def model_to_mimir(
     translator = FXGraphTranslator(world, module=traced)
     ops = translator.ops
     
-    # 1. Identify symbolic dimensions
-    sym_names = []
-    input_sym_names = [] # Store the symbol name for each dimension of each input
-    for shape in input_shapes:
-        this_input_syms = []
-        for d in shape:
-            if isinstance(d, str):
-                if d not in sym_names:
-                    sym_names.append(d)
-                this_input_syms.append(d)
-            elif d is None:
-                gen_name = f"n{len(sym_names)}"
-                sym_names.append(gen_name)
-                this_input_syms.append(gen_name)
-            else:
-                this_input_syms.append(None)
-        input_sym_names.append(this_input_syms)
+    shape_env = ShapeEnv(world)
+    normalized_input_shapes = [shape_env.normalize_shape(shape) for shape in input_shapes]
+    sym_names = list(shape_env.symbol_names)
+    input_sym_names = [
+        [dim if isinstance(dim, str) else None for dim in shape]
+        for shape in normalized_input_shapes
+    ]
 
     # 2. Construct Domain Type: [sym_dims..., tensor_inputs..., params...]
     # In MimIR, the function domain is represented as a Sigma (tuple) type.
@@ -102,9 +188,8 @@ def model_to_mimir(
     
     # Input Tensors
     tensor_input_types = []
-    for shape in input_shapes:
-        dims = [world.top_nat() if isinstance(d, (str, type(None))) else world.lit_nat(d) for d in shape]
-        tensor_input_types.append(world.arr(world.tuple(dims), ops.F32))
+    for shape in normalized_input_shapes:
+        tensor_input_types.append(tensor_type_from_shape(world, ops.F32, shape))
         
     # Parameters
     # FX weights/biases (extracted from get_attr) are passed as trailing arguments
@@ -113,8 +198,7 @@ def model_to_mimir(
         attr = traced
         for part in target.split("."):
             attr = getattr(attr, part)
-        p_shape = [world.lit_nat(d) for d in attr.shape]
-        param_types.append(world.arr(world.tuple(p_shape), ops.F32))
+        param_types.append(tensor_type_from_shape(world, ops.F32, attr.shape))
 
     full_dom_types = dom_types + tensor_input_types + param_types
     

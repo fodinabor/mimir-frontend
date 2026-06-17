@@ -3,6 +3,7 @@ import mim
 import operator
 import torch
 from torch import fx
+from torch._subclasses.fake_tensor import FakeTensorMode
 from pathlib import Path
 import tempfile
 
@@ -198,6 +199,19 @@ def test_shape_of_ignores_input_to_syms_side_channel():
     translator.ops.input_to_syms = {x: ["wrong"]}
 
     assert translator.ops.shape_of(x) == [n]
+
+
+def test_shape_of_reads_fake_tensor_from_fx_node_meta():
+    traced = fx.symbolic_trace(torch.nn.Identity())
+    placeholder = next(node for node in traced.graph.nodes if node.op == "placeholder")
+
+    with FakeTensorMode() as mode:
+        placeholder.meta["val"] = mode.from_tensor(torch.empty(2, 3))
+
+    world = make_world()
+    translator = FXGraphTranslator(world)
+
+    assert translator.ops.shape_of(placeholder) == [2, 3]
 
 
 @pytest.mark.parametrize("name,torch_op,python_op", SUPPORTED_BINARY_OPS)

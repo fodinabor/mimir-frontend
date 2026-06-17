@@ -71,6 +71,8 @@ class OperatorLibrary:
     def shape_of(self, value):
         if isinstance(value, mim.Def):
             return self._shape_dims(value)
+        if hasattr(value, "meta") and isinstance(value.meta, dict) and "val" in value.meta:
+            return self.shape_of(value.meta["val"])
         if hasattr(value, "shape"):
             return list(value.shape)
         raise TypeError(f"shape_of does not support {type(value)}")

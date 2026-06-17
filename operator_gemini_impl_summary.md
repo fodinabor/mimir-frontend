@@ -110,3 +110,93 @@
 | `split` 算子的动态性 | 目前仅支持 static extent 的分割。 | 遇到动态分割模型时再考虑增强。 |
 | `mlp_0` native crash | `mlp_0` 在越过 `le.Scalar/where` 后触发 MimIR native crash，当前不放入 pytest 普通路径。 | 单独用 `scripts/dump_inductor_mimir.py mlp_0 --partial` 或最小化 IR 后排查 MimIR core / shape 表达。 |
 | 非 CNN 下一批 blocker | 非 CNN 真实图下一批主要卡在 `index/scatter_add`、`max.dim`、`bmm`、random/dropout prims。 | 建议下一轮先做 `index.Tensor` + `scatter_add` 或 `max.dim`；Transformer 方向则优先 `bmm`。 |
+
+## 对照 TVM Translator 的最新进度评估
+
+本节对照以下两个基准实现重新评估当前 frontend 的位置：
+
+- `tvm/python/tvm/relax/frontend/torch/base_fx_graph_translator.py`
+- `tvm/python/tvm/relax/frontend/torch/exported_program_translator.py`
+
+结论先说：
+
+1. 我们在 `FX graph -> operator map -> high-level tensor IR` 这条主路径上已经站稳，尤其是 dynamic shape 的 shape source 已经比早期版本干净很多。
+2. 我们和 TVM 的主要差距已经不在“有没有基本 importer”，而在“输入语义是否完整”和“operator surface 是否足够大”。
+3. 当前实现更像一个面向 MimIR tensor plugin 的最小可用 importer，而不是像 TVM 那样覆盖 `ExportedProgram`、参数绑定、range constraint、控制流和大规模 operator registry 的通用 importer。
+
+### 已经和 TVM 对齐的部分
+
+| 维度 | TVM 做法 | 当前状态 | 结论 |
+| --- | --- | --- | --- |
+| 统一 `shape_of` 入口 | `shape_of` 优先看 `relax.Expr.struct_info.shape`，其次接受 `torch.Tensor.shape`。部分算子再回退到 `node.meta["val"]`。 | 我们已经建立统一 `shape_of`，优先读取 `mim.Def.type()`，同时支持直接对象 `.shape` 和 `fx.Node.meta["val"]`。 | 这一方向已经对齐，而且已经摆脱了 annotation/side-channel 主导 shape 的旧做法。 |
+| operator map | TVM 使用大规模 `create_convert_map()` 注册 `aten`/`operator`/高阶 op。 | 我们已从 `if/elif` 切到 map 注册。 | 架构方向对齐，但覆盖面还远小于 TVM。 |
+| dynamic shape 来源 | TVM 的符号 shape 来自 placeholder meta、`torch.SymInt`、struct info。 | 我们已经把 `FakeTensor/node.meta["val"]`、`mim.Def.type()`、annotation fallback 收敛到统一 shape source。 | 主路线正确，剩余问题集中在 SymInt expression 映射能力不够。 |
+| 避免 shape annotation 驱动语义 | TVM 不依赖 readable annotation 作为真实 shape 语义来源。 | 我们已经把 readable annotation 降为 fallback。 | 这一点已明确纠偏。 |
+| 多返回值/tuple 处理 | TVM 对 tuple output、`getitem`、部分多返回算子有稳定路径。 | 我们已支持 `operator.getitem`、`var_mean` 等 tuple 路径。 | 基础能力够用，但覆盖的多返回算子仍少。 |
+
+### 明显落后于 TVM 的部分
+
+| 维度 | TVM 做法 | 当前不足 | 影响 |
+| --- | --- | --- | --- |
+| `ExportedProgram` 支持 | TVM 有单独的 `ExportedProgramImporter`，直接处理 `graph_signature`、`input_specs`、`named_parameters`、`named_buffers`、`constants`。 | 我们目前只有 `fx.Graph` / `fx.GraphModule` 路径，没有真正的 `torch.export.ExportedProgram` importer。 | 目前仍然偏依赖 `symbolic_trace` 或 readable FX fixture，离真实生产输入还有一层。 |
+| 参数/Buffer/Constant 语义 | TVM 会区分 `USER_INPUT`、`PARAMETER`、`BUFFER`、`CONSTANT_TENSOR`，并支持 bind params。 | 我们目前把 `get_attr` 提取到 trailing args，但没有 graph-signature 级别的输入分类，也没有常量绑定机制。 | utility 和测试可用，但模型入口语义不完整。 |
+| range constraint | TVM 会从 `exported_program.range_constraints` 提取上下界，并挂到函数属性。 | 我们没有保存任何 symbol bound / equality / guard 信息。 | dynamic shape 目前只有“符号名保真”，没有约束语义。 |
+| SymInt / Sympy expression | TVM 会把 `torch.SymInt` 映射为 `SizeVar`，并通过 `_process_derived_symbol` 处理派生符号。 | 我们当前 `ShapeEnv` 只稳定支持 literal 和“按名称复用 symbol”；复杂表达式大多仍会退化。 | `s0 + 1`、`2 * s0`、guarded dim 等情况还没有严肃支持。 |
+| 控制流/高阶子图 | TVM 已处理 `cond` 分支子图导入，并缓存 branch function。 | 我们没有 `cond` / higher-order op 支持。 | 真实导出图一旦出现控制流，会直接中断。 |
+| operator surface | TVM 的 convert map 覆盖面非常大，包括 NN、image、index/scatter、norm、loss、RNN、upsample 等。 | 我们当前仍聚焦 elementwise/broadcast/injective/reduce/mm/addmm/split。 | 当前能力更像“非 CNN、非复杂 indexing、非控制流”的子集 importer。 |
+| dtype 处理 | TVM 有完整 `_convert_data_type` 和大量 dtype-sensitive 逻辑。 | 我们按当前目标明确暂不处理 dtype。 | 这是有意 scope 裁剪，但也意味着和 TVM 还不在同一完整度层级。 |
+
+### 当前实现相对 TVM 的一个优势
+
+有一件事目前我们的方向比 TVM 基线更贴近 MimIR 的约束，那就是 frontend 和 tensor plugin 的职责边界正在变清晰：
+
+- TVM 许多 shape 语义最终落在 Relax op 的 `struct_info` / shape expr 上。
+- 我们这边已经明确，像 `pad_shape`、`concat_shape`、`dot_general_shape` 这类 shape function 应优先由 MimIR tensor plugin 的返回类型承担。
+- 这意味着我们后续不应该把 shape 逻辑重复硬编码在 frontend，而是把 frontend 限定为：
+  - 提供正确的 `shape_of`
+  - 正确构造 dependent input type
+  - 在必须显式给出 `s_out` 的场景做最小必要 shape 计算
+
+这条边界如果守住，长期维护成本会比继续在 frontend 手写 shape 推导更低。
+
+### 重新评估当前进度
+
+如果以 TVM 的两个 translator 为标杆，可以把当前进度分成四层：
+
+| 层级 | 当前状态 | 评价 |
+| --- | --- | --- |
+| Level 0: 能翻译简单 FX 图 | 已完成 | 这部分已经稳定。 |
+| Level 1: dynamic shape 主路径正确 | 基本完成 | `shape_of`、FakeTensor meta、dependent sigma、`ShapeEnv` 都已经到位。 |
+| Level 2: 中等规模真实图可持续扩展 | 部分完成 | `mlp_1`、`lstm_1` 已打通，但 frontier 仍卡在 `index/max.dim/convolution`。 |
+| Level 3: 类 TVM 的通用 importer | 明显未完成 | 缺 `ExportedProgram`、range constraints、控制流、参数绑定体系、复杂 operator surface。 |
+
+更直接一点说：我们已经脱离“玩具 importer”，但距离 TVM 那种“通用前端”还有一整层基础设施要补。
+
+### 当前最关键的不足
+
+从 MimIR frontend 的现实优先级看，不足之处不是平均分布的，优先级很清楚：
+
+1. `ExportedProgram` 缺失
+2. SymInt expression / shape constraint 缺失
+3. indexing/scatter/max.dim/bmm 这批真实模型 blocker
+4. plugin-shape op 的系统性接入，例如 `pad`
+5. `compile_phase="default"` 的稳定性问题
+
+其中前两项属于“前端基础设施缺口”，后三项属于“能力面和可用性缺口”。
+
+### 建议的下一阶段计划
+
+| 优先级 | 事项 | 原因 |
+| --- | --- | --- |
+| P0 | 新增 `ExportedProgram -> MimIR` importer 骨架，先只支持 `USER_INPUT/PARAMETER/BUFFER/CONSTANT_TENSOR` 四类 input spec，不求一次补全全部 operator。 | 这是和 TVM 最大的架构差距，补上后输入语义会立刻正规化。 |
+| P1 | 把 `ShapeEnv` 从“按名字复用 Nat”升级为“支持简单 affine SymInt expression 和约束记录”。 | 这决定 dynamic shape 能否继续往真实模型推进。 |
+| P1 | 为 `index.Tensor`、`max.dim`、`bmm` 建立最小可用支持，继续推进真实图 frontier。 | 这是当前非 CNN 模型最直接的 blocker。 |
+| P2 | 开始系统接入 plugin-shape operator，首批建议 `pad`。 | 这会验证“frontend 不重复 shape 逻辑”的边界是否真的成立。 |
+| P2 | 给 `model_to_mimir` / importer 增加更严格的 IR FileCheck 风格测试，不只断言“能翻译”，而是断言 dependent function signature、symbol 复用和关键 op 序列。 | 当前测试方向是对的，但还可以继续向 TVM 那种结构性校验靠拢。 |
+| P3 | 单独排查 `default compile phase` crash，确认是 frontend IR 非法还是 MimIR lowering bug。 | 这是稳定性问题，但前提是先把 high-level importer 能力继续往前推。 |
+
+### 结论
+
+对照 TVM 之后，当前 frontend 的定位可以明确成一句话：
+
+> 我们已经完成了 MimIR 版 FX importer 的第一阶段，核心是“围绕 tensor plugin 的 high-level FX 导入 + 基本 dynamic shape 保真”；下一阶段不应再零散补小算子，而应先补 `ExportedProgram` 输入语义和 SymInt/constraint 基建，再继续推真实图 frontier。

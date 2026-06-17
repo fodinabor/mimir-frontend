@@ -10,6 +10,7 @@ import torch
 from torch import fx
 
 from .translator import FXGraphTranslator
+from .utils import ShapeEnv, _shape_from_meta_value, tensor_type_from_shape
 
 
 DEFAULT_INDUCTOR_LOG_ROOT = Path("/Users/zc/courses/compiler/pytorch-play/logs/attn_debug/inductor")
@@ -62,23 +63,26 @@ def parse_annotation(annotation: str):
 def make_mimir_inputs_from_annotations(world: mim.World, graph_module: fx.GraphModule) -> list[mim.Def]:
     ops = FXGraphTranslator(world).ops
     inputs = []
+    placeholders = [node for node in graph_module.graph.nodes if node.op == "placeholder"]
+    parameters = list(inspect.signature(graph_module.forward).parameters.values())
+    shape_env = ShapeEnv(world)
 
-    for parameter in inspect.signature(graph_module.forward).parameters.values():
+    for parameter, placeholder in zip(parameters, placeholders):
         parsed = parse_annotation(parameter.annotation)
         if parsed[0] == "sym":
-            inputs.append(world.mut_con(world.type_nat()).var())
+            inputs.append(shape_env.symbol_def(parsed[1]))
             continue
 
-        _, dtype, dims = parsed
-        elem_type = world.type_bool() if dtype.startswith("b") else ops.F32
-        mim_dims = [world.lit_nat(int(dim)) if dim.isdecimal() else world.top_nat() for dim in dims]
-
-        if not mim_dims:
-            tensor_type = elem_type
-        elif len(mim_dims) == 1:
-            tensor_type = world.arr(mim_dims[0], elem_type)
+        if "val" in placeholder.meta:
+            meta_value = placeholder.meta["val"]
+            elem_type = world.type_bool() if getattr(meta_value, "dtype", None) == torch.bool else ops.F32
+            shape = shape_env.normalize_shape(_shape_from_meta_value(meta_value))
+            tensor_type = tensor_type_from_shape(world, elem_type, shape, shape_env=shape_env, symbolic=True)
         else:
-            tensor_type = world.arr(world.tuple(mim_dims), elem_type)
+            _, dtype, dims = parsed
+            elem_type = world.type_bool() if dtype.startswith("b") else ops.F32
+            shape = shape_env.normalize_shape(dims)
+            tensor_type = tensor_type_from_shape(world, elem_type, shape, shape_env=shape_env, symbolic=True)
         inputs.append(world.mut_con(tensor_type).var())
 
     for node in graph_module.graph.nodes:
@@ -93,13 +97,7 @@ def make_mimir_inputs_from_annotations(world: mim.World, graph_module: fx.GraphM
             elem_type = world.type_bool()
         else:
             elem_type = ops.F32
-        mim_dims = [world.lit_nat(dim) for dim in attr.shape]
-        if not mim_dims:
-            tensor_type = elem_type
-        elif len(mim_dims) == 1:
-            tensor_type = world.arr(mim_dims[0], elem_type)
-        else:
-            tensor_type = world.arr(world.tuple(mim_dims), elem_type)
+        tensor_type = tensor_type_from_shape(world, elem_type, attr.shape)
         inputs.append(world.mut_con(tensor_type).var())
 
     return inputs
