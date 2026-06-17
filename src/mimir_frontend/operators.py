@@ -65,8 +65,15 @@ class OperatorLibrary:
         self.bool_not_axm = bind_bit_axm(core.bit1.neg)
 
     def _rank_and_shape(self, tensor_def):
-        dims = self._shape_dims(tensor_def)
+        dims = self.shape_of(tensor_def)
         return self.world.lit_nat(len(dims)), self.world.tuple(dims)
+
+    def shape_of(self, value):
+        if isinstance(value, mim.Def):
+            return self._shape_dims(value)
+        if hasattr(value, "shape"):
+            return list(value.shape)
+        raise TypeError(f"shape_of does not support {type(value)}")
 
     def _shape_dims(self, tensor_def):
         dims = []
@@ -74,17 +81,6 @@ class OperatorLibrary:
         while isinstance(tensor_type, mim.Seq):
             dims.append(tensor_type.arity())
             tensor_type = tensor_type.body()
-            
-        if hasattr(self, "input_to_syms") and tensor_def in self.input_to_syms:
-            sym_names = self.input_to_syms[tensor_def]
-            final_dims = []
-            for i, name in enumerate(sym_names):
-                if name is not None and name in self.sym_map:
-                    final_dims.append(self.sym_map[name])
-                else:
-                    final_dims.append(dims[i])
-            return final_dims
-            
         return dims
 
     def _dim_literal_value(self, dim):
@@ -198,8 +194,8 @@ class OperatorLibrary:
         if out_type is None:
             out_type = in_type
             
-        s_lhs_dims = self._shape_dims(lhs)
-        s_rhs_dims = self._shape_dims(rhs)
+        s_lhs_dims = self.shape_of(lhs)
+        s_rhs_dims = self.shape_of(rhs)
         output_dims = self._broadcast_shape_dims(s_lhs_dims, s_rhs_dims)
         
         if not self._same_shape_dims(s_lhs_dims, output_dims):
@@ -362,9 +358,9 @@ class OperatorLibrary:
 
     # Logical
     def where(self, cond, x, y):
-        cond_dims = self._shape_dims(cond)
-        x_dims = self._shape_dims(x)
-        y_dims = self._shape_dims(y)
+        cond_dims = self.shape_of(cond)
+        x_dims = self.shape_of(x)
+        y_dims = self.shape_of(y)
         output_dims = self._broadcast_shape_dims(self._broadcast_shape_dims(cond_dims, x_dims), y_dims)
 
         if not self._same_shape_dims(cond_dims, output_dims):
@@ -395,7 +391,7 @@ class OperatorLibrary:
 
     def expand(self, input, shape):
         in_rank, in_shape = self._rank_and_shape(input)
-        in_dims = self._shape_dims(input)
+        in_dims = self.shape_of(input)
         in_rank_val = len(in_dims)
 
         shape = list(shape)
@@ -478,7 +474,7 @@ class OperatorLibrary:
         return self.world.app(callee, input_is)
 
     def _reduce_aff(self, input, output_type, reducer, init, dim=None, keepdim=False, return_shape=False):
-        input_dims = self._shape_dims(input)
+        input_dims = self.shape_of(input)
         input_rank = len(input_dims)
         reduce_dims = self._normalize_reduce_dims(dim, input_rank)
         kept_dims = [axis for axis in range(input_rank) if axis not in reduce_dims]
@@ -683,7 +679,7 @@ class OperatorLibrary:
 
     def slice(self, x, dim, start, end, step=1):
         rank, in_shape = self._rank_and_shape(x)
-        in_dims = self._shape_dims(x)
+        in_dims = self.shape_of(x)
         rank_val = len(in_dims)
         elem_t = self._tensor_element_type(x)
 
@@ -737,7 +733,7 @@ class OperatorLibrary:
         num_inputs = tensors.num_projs()
         first_tensor = tensors.proj(num_inputs, 0)
         rank, _ = self._rank_and_shape(first_tensor)
-        rank_val = len(self._shape_dims(first_tensor))
+        rank_val = len(self.shape_of(first_tensor))
         elem_t = self._tensor_element_type(first_tensor)
         
         if dim < 0: dim += rank_val
@@ -772,7 +768,7 @@ class OperatorLibrary:
         return d == self.world.lit_nat(1)
 
     def squeeze(self, x, dim=None):
-        in_dims = self._shape_dims(x)
+        in_dims = self.shape_of(x)
         if dim is None:
             out_dims = [d for d in in_dims if not self._is_one(d)]
         else:
@@ -787,14 +783,14 @@ class OperatorLibrary:
         return self.reshape(x, out_dims)
 
     def unsqueeze(self, x, dim):
-        in_dims = self._shape_dims(x)
+        in_dims = self.shape_of(x)
         if dim < 0: dim += len(in_dims) + 1
         out_dims = list(in_dims)
         out_dims.insert(dim, 1)
         return self.reshape(x, out_dims)
 
     def split(self, x, split_size_or_sections, dim=0):
-        in_dims = self._shape_dims(x)
+        in_dims = self.shape_of(x)
         rank_val = len(in_dims)
         if dim < 0: dim += rank_val
         

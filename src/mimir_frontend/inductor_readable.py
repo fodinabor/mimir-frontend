@@ -126,7 +126,6 @@ def translate_inductor_readable_prefix(
     translator.env = {}
     placeholders = [node for node in graph.nodes if node.op == "placeholder"]
     param_nodes = [node for node in graph.nodes if node.op == "get_attr"]
-    translator.ops.input_to_syms = {}
 
     for node, arg in zip(placeholders, inputs[: len(placeholders)]):
         translator.env[node] = arg

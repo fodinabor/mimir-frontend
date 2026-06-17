@@ -19,6 +19,18 @@ def test_model_to_mimir_outputs_high_level_tensor_ir():
     assert "%tensor.unary" in ir
 
 
+def test_model_to_mimir_signature_uses_symbolic_nat_in_input_tensor_types():
+    ir = model_to_mimir(
+        AddReluModel(),
+        input_shapes=[("n",), ("n",)],
+        compile_phase="high_level",
+    )
+
+    first_line = ir.splitlines()[0]
+    assert "⊤:Nat" not in first_line
+    assert ": Nat" in first_line
+
+
 def test_model_to_mimir_can_use_default_compile_phase():
     ir = model_to_mimir(
         AddReluModel(),

@@ -251,7 +251,7 @@ class FXGraphTranslator:
             obj = args[0]
             attr_name = args[1] if len(args) > 1 else node.kwargs.get("name")
             if attr_name == "shape":
-                return self.ops._shape_dims(obj)
+                return self.ops.shape_of(obj)
             else:
                 raise NotImplementedError(f"getattr for {attr_name} is not implemented")
         return convert
@@ -372,69 +372,97 @@ class FXGraphTranslator:
         else:
             return args
 
+    def _tensor_type_parts(self, tensor_type: mim.Def) -> tuple[list[mim.Def], mim.Def]:
+        dims = []
+        elem_type = tensor_type
+        while isinstance(elem_type, mim.Seq):
+            dims.append(elem_type.arity())
+            elem_type = elem_type.body()
+        return dims, elem_type
+
+    def _rebuild_tensor_type(self, dims: list[mim.Def], elem_type: mim.Def) -> mim.Def:
+        if not dims:
+            return elem_type
+        if len(dims) == 1:
+            return self.world.arr(dims[0], elem_type)
+        return self.world.arr(self.world.tuple(dims), elem_type)
+
+    def _specialize_input_type(self, tensor_type: mim.Def, input_index: int) -> mim.Def:
+        if not hasattr(self, "input_sym_names") or input_index >= len(self.input_sym_names):
+            return tensor_type
+
+        dims, elem_type = self._tensor_type_parts(tensor_type)
+        if not dims:
+            return tensor_type
+
+        changed = False
+        specialized_dims = []
+        for dim, sym_name in zip(dims, self.input_sym_names[input_index]):
+            if sym_name is not None and sym_name in self.ops.sym_map:
+                specialized_dims.append(self.ops.sym_map[sym_name])
+                changed = True
+            else:
+                specialized_dims.append(dim)
+        specialized_dims.extend(dims[len(specialized_dims):])
+
+        if not changed:
+            return tensor_type
+        return self._rebuild_tensor_type(specialized_dims, elem_type)
+
     def translate_as_function(self, graph: fx.Graph, input_types: list[mim.Def], name: str = "main", sym_names: list[str] = None) -> mim.Lam:
         placeholders = [node for node in graph.nodes if node.op == "placeholder"]
         param_nodes = [node for node in graph.nodes if node.op == "get_attr"]
         num_inputs = len(placeholders) + len(param_nodes)
         num_sym = len(sym_names) if sym_names else 0
-        
-        # 1. Determine the output type by dry-running translation with dummy variables
-        dummy_inputs = [self.world.mut_con(it).var() for it in input_types[-num_inputs:]]
-        
-        old_env = self.env
-        old_sym_map = self.ops.sym_map
-        self.env = {}
-        
-        res_def = self.translate(graph, dummy_inputs)
-        out_type = res_def.type()
-        self.env = old_env
 
-        # 2. Create the closed CPS function (fun)
-        ret_cn_type = self.world.cn([out_type])
-        dom_with_ret = self.world.sigma(input_types + [ret_cn_type])
+        old_sym_map = self.ops.sym_map
+        num_params = len(input_types) + 1
+        dom_with_ret = self.world.mut_sigma(num_params)
+
+        for i in range(num_sym):
+            dom_with_ret.set(i, self.world.type_nat())
+
+        sigma_var = dom_with_ret.var()
+        sigma_sym_params = [sigma_var.proj(num_params, i) for i in range(num_sym)]
+
+        if sym_names:
+            for sym_name, sym_param in zip(sym_names, sigma_sym_params):
+                self.ops.sym_map[sym_name] = sym_param
+
+        for i, tensor_type in enumerate(input_types[num_sym:num_sym + len(placeholders)]):
+            dom_with_ret.set(num_sym + i, self._specialize_input_type(tensor_type, i))
+
+        for i, param_type in enumerate(input_types[num_sym + len(placeholders):]):
+            dom_with_ret.set(num_sym + len(placeholders) + i, param_type)
+
         lam = self.world.mut_con(dom_with_ret)
         lam.set(name)
-        
-        # 3. Map lambda parameters to FX placeholders and get_attr nodes
-        num_params = len(input_types) + 1
-        all_params = [lam.var().proj(num_params, i) for i in range(num_params)]
-        
-        # Map symbols
+
+        lam_sym_params = [lam.var().proj(num_params, i) for i in range(num_sym)]
         if sym_names:
-            for i, n in enumerate(sym_names):
-                self.ops.sym_map[n] = all_params[i]
-                
-        actual_inputs = all_params[num_sym:-1]
-        ret_cont = all_params[-1]
-        
-        # 4. Perform actual translation
+            for sym_name, sym_param in zip(sym_names, lam_sym_params):
+                self.ops.sym_map[sym_name] = sym_param
+
+        actual_inputs = [lam.var().proj(num_params, i) for i in range(num_sym, num_sym + num_inputs)]
         result = self.translate(graph, actual_inputs)
-        
-        # Apply the return continuation to the result
+
+        dom_with_ret.set(num_params - 1, self.world.cn([result.type()]))
+        ret_cont = lam.var().proj(num_params, num_params - 1)
         lam.app(True, ret_cont, [result])
-        
-        # Externalize only after it's closed (body set)
         lam.externalize()
-        
-        # Restore sym_map
+
         self.ops.sym_map = old_sym_map
-        
         return lam
 
     def translate(self, graph: fx.Graph, inputs: list[mim.Def]) -> mim.Def:
         self.env = {}
         placeholders = [node for node in graph.nodes if node.op == "placeholder"]
         param_nodes = [node for node in graph.nodes if node.op == "get_attr"]
-        
-        # Track symbolic info for inputs
-        self.ops.input_to_syms = {}
-        
+
         # Map placeholders to first part of inputs
-        for i, (node, arg) in enumerate(zip(placeholders, inputs[:len(placeholders)])):
+        for node, arg in zip(placeholders, inputs[:len(placeholders)]):
             self.env[node] = arg
-            if hasattr(self, "input_sym_names") and i < len(self.input_sym_names):
-                self.ops.input_to_syms[arg] = self.input_sym_names[i]
-            
+
         # Map get_attr to the rest of inputs
         for node, arg in zip(param_nodes, inputs[len(placeholders):]):
             self.env[node] = arg

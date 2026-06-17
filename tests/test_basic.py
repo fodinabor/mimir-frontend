@@ -17,11 +17,10 @@ def make_world():
 
 def make_tensor_type(world, elem_type, shape_kind, rank):
     if shape_kind == "dynamic":
+        dims = [world.mut_con(world.type_nat()).var() for _ in range(rank)]
         if rank == 1:
-            return world.arr(world.top_nat(), elem_type)
-        shape_ty = world.arr(world.lit_nat(rank), world.type_nat())
-        shape = world.mut_con(shape_ty).var()
-        return world.arr(shape, elem_type)
+            return world.arr(dims[0], elem_type)
+        return world.arr(world.tuple(dims), elem_type)
 
     if rank == 1:
         return world.arr(world.lit_nat(8), elem_type)
@@ -101,6 +100,17 @@ def tensor_shape_values(tensor_def):
     return values
 
 
+def make_symbolic_tensor_input(world, dims, elem_type=None):
+    ops = FXGraphTranslator(world).ops
+    if elem_type is None:
+        elem_type = ops.F32
+    if len(dims) == 1:
+        tensor_ty = world.arr(dims[0], elem_type)
+    else:
+        tensor_ty = world.arr(world.tuple(dims), elem_type)
+    return world.mut_con(tensor_ty).var()
+
+
 def assert_translates_to_element_type_for_all_shapes(model_factory, input_count, element_type_fn):
     for shape_kind in ("static", "dynamic"):
         for rank in (1, 3):
@@ -154,6 +164,40 @@ def test_single_elementwise_operator(shape_kind, rank):
     result = translate_model(Model(), make_inputs(world, 2, shape_kind, rank))
 
     assert isinstance(result, mim.Def)
+
+
+def test_shape_of_reads_symbolic_dims_from_mim_def_type():
+    world = make_world()
+    translator = FXGraphTranslator(world)
+    dims = [world.mut_con(world.type_nat()).var() for _ in range(3)]
+    x = make_symbolic_tensor_input(world, dims)
+
+    assert translator.ops.shape_of(x) == dims
+
+
+def test_binary_operator_uses_tensor_type_shape_without_input_sym_names():
+    world = make_world()
+    translator = FXGraphTranslator(world)
+    n = world.mut_con(world.type_nat()).var()
+    x = make_symbolic_tensor_input(world, [n])
+    y = make_symbolic_tensor_input(world, [n])
+
+    result = translator.ops.add(x, y)
+
+    assert tensor_shape(result) == [n]
+
+
+def test_shape_of_ignores_input_to_syms_side_channel():
+    world = make_world()
+    translator = FXGraphTranslator(world)
+    n = world.mut_con(world.type_nat()).var()
+    wrong = world.mut_con(world.type_nat()).var()
+    x = make_symbolic_tensor_input(world, [n])
+
+    translator.ops.sym_map["wrong"] = wrong
+    translator.ops.input_to_syms = {x: ["wrong"]}
+
+    assert translator.ops.shape_of(x) == [n]
 
 
 @pytest.mark.parametrize("name,torch_op,python_op", SUPPORTED_BINARY_OPS)
