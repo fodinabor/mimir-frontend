@@ -2,7 +2,8 @@ import mim
 import pytest
 
 from mimir_frontend.translator import FXGraphTranslator
-
+from mimir_frontend import expr
+from mim._plugins.tensor import tensor
 
 def make_world() -> mim.World:
     driver = mim.Driver()
@@ -32,11 +33,10 @@ def assert_dim_is_literal(dim: mim.Def, value):
 
 
 def assert_dims_same(ops, lhs, rhs):
-    assert ops._same_dim(lhs, rhs), f"expected dims to be equal: {lhs} vs {rhs}"
-
+    assert ops.rules._same_dim(lhs, rhs), f"expected dims to be equal: {lhs} vs {rhs}"
 
 def assert_dims_not_same(ops, lhs, rhs):
-    assert not ops._same_dim(lhs, rhs), f"expected dims to differ: {lhs} vs {rhs}"
+    assert not ops.rules._same_dim(lhs, rhs), f"expected dims to differ: {lhs} vs {rhs}"
 
 # expand (n, 4) -> (-1, 4)
 def test_expand_keeps_existing_symbolic_dim_with_negative_one():
@@ -97,6 +97,45 @@ def test_sum_without_keepdim_preserves_remaining_symbol_order():
     assert len(dims) == 2
     assert_dims_same(ops, dims[0], n)
     assert_dims_same(ops, dims[1], k)
+
+
+def test_reduce_shape_spec_without_keepdim_captures_map_reduce_aff_shapes():
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    n = world.mut_con(world.type_nat()).var()
+    m = world.mut_con(world.type_nat()).var()
+    k = world.mut_con(world.type_nat()).var()
+
+    spec = ops.rules.reduce_shape_spec([n, m, k], dim=1, keepdim=False)
+
+    assert spec.reduce_dims == [1]
+    assert spec.kept_dims == [0, 2]
+    assert spec.input_projections == [0, 2, 1]
+    assert_dims_same(ops, spec.output_dims[0], n)
+    assert_dims_same(ops, spec.output_dims[1], k)
+    assert_dims_same(ops, spec.loop_dims[0], n)
+    assert_dims_same(ops, spec.loop_dims[1], k)
+    assert_dims_same(ops, spec.loop_dims[2], m)
+
+
+def test_reduce_shape_spec_keepdim_captures_map_reduce_aff_shapes():
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    n = world.mut_con(world.type_nat()).var()
+    m = world.mut_con(world.type_nat()).var()
+
+    spec = ops.rules.reduce_shape_spec([n, m, world.lit_nat(8)], dim=1, keepdim=True)
+
+    assert spec.reduce_dims == [1]
+    assert spec.kept_dims == [0, 2]
+    assert spec.input_projections == [0, 3, 2]
+    assert_dims_same(ops, spec.output_dims[0], n)
+    assert_dim_is_literal(spec.output_dims[1], 1)
+    assert_dim_is_literal(spec.output_dims[2], 8)
+    assert_dims_same(ops, spec.loop_dims[0], n)
+    assert_dim_is_literal(spec.loop_dims[1], 1)
+    assert_dim_is_literal(spec.loop_dims[2], 8)
+    assert_dims_same(ops, spec.loop_dims[3], m)
 
 # transpose (n, m, k) -> (k, m, n)
 def test_transpose_permutates_symbolic_dims_without_losing_identity():
@@ -209,8 +248,95 @@ def test_cat_leaves_plugin_to_compute_concat_dim_so_shared_symbol_info_is_not_ex
     assert_dims_not_same(ops, dims[1], world.lit_nat(3))
     assert_dims_not_same(ops, dims[1], world.lit_nat(5))
 
+
+def test_transpose_shape_rule_permutates_symbolic_dims():
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    n = world.mut_con(world.type_nat()).var()
+    m = world.mut_con(world.type_nat()).var()
+
+    out = ops.rules.transpose_shape([n, world.lit_nat(4), m], [2, 1, 0])
+
+    assert_dims_same(ops, out[0], m)
+    assert_dim_is_literal(out[1], 4)
+    assert_dims_same(ops, out[2], n)
+
+
+def test_select_shape_rule_removes_selected_dim():
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    n = world.mut_con(world.type_nat()).var()
+    m = world.mut_con(world.type_nat()).var()
+
+    out = ops.rules.select_shape([n, m, world.lit_nat(8)], dim=1)
+
+    assert len(out) == 2
+    assert_dims_same(ops, out[0], n)
+    assert_dim_is_literal(out[1], 8)
+
+
+def test_split_shapes_rule_preserves_outer_dims_and_sections():
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    n = world.mut_con(world.type_nat()).var()
+
+    outputs = ops.rules.split_shapes([n, world.lit_nat(8)], [3, 5], dim=1)
+
+    assert len(outputs) == 2
+    assert_dims_same(ops, outputs[0][0], n)
+    assert_dim_is_literal(outputs[0][1], 3)
+    assert_dims_same(ops, outputs[1][0], n)
+    assert_dim_is_literal(outputs[1][1], 5)
+
+
+def test_concat_result_shape_can_be_read_from_result_type_without_frontend_cache():
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    n = world.mut_con(world.type_nat()).var()
+    x = make_symbolic_tensor_input(world, [n, world.lit_nat(3)])
+    y = make_symbolic_tensor_input(world, [n, world.lit_nat(5)])
+
+    rank = world.lit_nat(2)
+    callee = world.annex(tensor.concat.value)
+    callee = world.app(callee, world.tuple([ops.F32, world.lit_nat(2), rank]))
+    callee = world.app(callee, world.lit(world.type_idx(rank), 1))
+    callee = world.app(callee, world.tuple([
+        world.tuple(ops.shape_of(x)),
+        world.tuple(ops.shape_of(y)),
+    ]))
+    result = world.app(callee, world.tuple([x, y]))
+
+    uncached_ops = FXGraphTranslator(world).ops
+    dims = uncached_ops.shape_of(result)
+
+    assert_dims_same(uncached_ops, dims[0], n)
+    assert_dim_is_literal(dims[1], 8)
+
+
+def test_pad_result_shape_can_be_read_from_result_type_without_frontend_cache():
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    n = world.mut_con(world.type_nat()).var()
+    x = make_symbolic_tensor_input(world, [n, world.lit_nat(4)])
+    lo = world.tuple([world.lit_nat(1), world.lit_nat(2)])
+    hi = world.tuple([world.lit_nat(3), world.lit_nat(4)])
+
+    rank = world.lit_nat(2)
+    callee = world.annex(tensor.pad.value)
+    callee = world.app(callee, world.tuple([ops.F32, rank]))
+    callee = world.app(callee, world.tuple(ops.shape_of(x)))
+    callee = world.app(callee, world.tuple([world.lit_nat(0), lo, hi]))
+    result = world.app(callee, world.tuple([x, ops._f32_float_lit(0.0)]))
+
+    uncached_ops = FXGraphTranslator(world).ops
+    dims = uncached_ops.shape_of(result)
+
+    assert len(dims) == 2
+    assert_dims_not_same(uncached_ops, dims[0], n)
+    assert_dim_is_literal(dims[1], 10)
+
+
 # reshape (n, m) -> (n * m)
-@pytest.mark.xfail(reason="reshape 目前不会保留乘积等式，只接受显式目标 shape")
 def test_reshape_does_not_infer_product_equality():
     world = make_world()
     ops = FXGraphTranslator(world).ops
@@ -218,7 +344,8 @@ def test_reshape_does_not_infer_product_equality():
     m = world.mut_con(world.type_nat()).var()
     x = make_symbolic_tensor_input(world, [n, m])
 
-    result = ops.reshape(x, [n * m])  # type: ignore[operator]
+    prod = expr.mul(n, m)
+    result = ops.reshape(x, [prod])
     dims = ops.shape_of(result)
 
-    assert_dims_same(ops, dims[0], n)
+    assert_dims_same(ops, dims[0], prod)

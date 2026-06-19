@@ -1,50 +1,54 @@
 import mim
 import struct
 from mim._plugins.affine import affine
-from mim._plugins.math import math
+from mim._plugins.math import math, _math_arith, _math_extrema, _math_cmp, _math_exp, _math_tri, _math_rt
 from mim._plugins.tensor import tensor
-from mim._plugins.core import core
+from mim._plugins.core import core, _core_bit1, _core_bit2
+
+from .shape_rules import ShapeRules
+from . import expr
 
 class OperatorLibrary:
     def __init__(self, world: mim.World):
         self.world = world
+        self.rules = ShapeRules(world)
         self.f32_config = world.annex(math.f32.value)
         self.F32 = world.annex(math.F32.value)
         self.Bool = world.type_bool()
         self.mode0 = world.lit_nat_0()
         self.sym_map = {} # Mapping from symbolic name to MimIR Nat variable
-        self._shape_cache = {}
+        self._shape_cache: dict[mim.Def, list[mim.Def]] = {}
 
         
         def bind_math_axm(axm_enum):
             axm = world.annex(axm_enum.value)
-            # %math.arith.add {pe} mode
+            # %_math_arith.add {pe} mode
             axm = world.app(axm, self.f32_config)
             return world.app(axm, self.mode0)
 
         # Arithmetic
-        self.f32_add_axm = bind_math_axm(math.arith.add)
-        self.f32_sub_axm = bind_math_axm(math.arith.sub)
-        self.f32_mul_axm = bind_math_axm(math.arith.mul)
-        self.f32_div_axm = bind_math_axm(math.arith.div)
+        self.f32_add_axm = bind_math_axm(_math_arith.add)
+        self.f32_sub_axm = bind_math_axm(_math_arith.sub)
+        self.f32_mul_axm = bind_math_axm(_math_arith.mul)
+        self.f32_div_axm = bind_math_axm(_math_arith.div)
         
         # Extrema
-        self.f32_max_axm = bind_math_axm(math.extrema.fmax)
-        self.f32_min_axm = bind_math_axm(math.extrema.fmin)
+        self.f32_max_axm = bind_math_axm(_math_extrema.fmax)
+        self.f32_min_axm = bind_math_axm(_math_extrema.fmin)
         
         # Comparisons
-        self.f32_eq_axm = bind_math_axm(math.cmp.e)
-        self.f32_ne_axm = bind_math_axm(math.cmp.ne)
-        self.f32_lt_axm = bind_math_axm(math.cmp.l)
-        self.f32_le_axm = bind_math_axm(math.cmp.le)
-        self.f32_gt_axm = bind_math_axm(math.cmp.g)
-        self.f32_ge_axm = bind_math_axm(math.cmp.ge)
+        self.f32_eq_axm = bind_math_axm(_math_cmp.e)
+        self.f32_ne_axm = bind_math_axm(_math_cmp.ne)
+        self.f32_lt_axm = bind_math_axm(_math_cmp.l)
+        self.f32_le_axm = bind_math_axm(_math_cmp.le)
+        self.f32_gt_axm = bind_math_axm(_math_cmp.g)
+        self.f32_ge_axm = bind_math_axm(_math_cmp.ge)
         
         # Unary
-        self.f32_exp_axm = bind_math_axm(math.exp.exp)
-        self.f32_log_axm = bind_math_axm(math.exp.log)
-        self.f32_tanh_axm = bind_math_axm(math.tri.tanh)
-        self.f32_sqrt_axm = bind_math_axm(math.rt.sq)
+        self.f32_exp_axm = bind_math_axm(_math_exp.exp)
+        self.f32_log_axm = bind_math_axm(_math_exp.log)
+        self.f32_tanh_axm = bind_math_axm(_math_tri.tanh)
+        self.f32_sqrt_axm = bind_math_axm(_math_rt.sq)
         self.f32_abs_axm = bind_math_axm(math.abs)
         self.f32_neg_axm = bind_math_axm(math.minus)
         
@@ -62,24 +66,51 @@ class OperatorLibrary:
             axm = world.app(axm, s_bool)
             return world.app(axm, m_scalar)
             
-        self.bool_and_axm = bind_bit_axm(core.bit2.and_)
-        self.bool_not_axm = bind_bit_axm(core.bit1.neg)
+        self.bool_and_axm = bind_bit_axm(_core_bit2.and_)
+        self.bool_not_axm = bind_bit_axm(_core_bit1.neg)
 
     def _rank_and_shape(self, tensor_def):
         dims = self.shape_of(tensor_def)
         return self.world.lit_nat(len(dims)), self.world.tuple(dims)
 
     def shape_of(self, value):
+        """
+        Unified way to retrieve shape dims from a MimIR Def or PyTorch object.
+        Priority:
+        1. Explicitly mapped symbolic dims (for inputs)
+        2. Local shape cache (for derived tensors, preserves 1-dims)
+        3. MimIR Type system (Arr arity)
+        4. PyTorch metadata (FakeTensor)
+        """
         if isinstance(value, mim.Def):
-            cached = self._shape_cache.get(id(value))
+            # 1. Check symbolic map for inputs
+            if hasattr(self, "input_to_syms") and value in self.input_to_syms:
+                sym_names = self.input_to_syms[value]
+                dims = self._shape_dims(value)
+                final_dims = []
+                for i, name in enumerate(sym_names):
+                    if name is not None and name in self.sym_map:
+                        final_dims.append(self.sym_map[name])
+                    else:
+                        final_dims.append(dims[i])
+                return final_dims
+
+            # 2. Check cache FIRST to preserve singleton (1) dimensions
+            # because MimIR type system normalizes them away.
+            cached = self._shape_cache.get(value)
             if cached is not None:
                 return list(cached)
-        if isinstance(value, mim.Def):
-            return self._shape_dims(value)
+
+            # 3. Try type system
+            dims = self._shape_dims(value)
+            return dims
+        
+        # 4. Fallback to metadata
         if hasattr(value, "meta") and isinstance(value.meta, dict) and "val" in value.meta:
             return self.shape_of(value.meta["val"])
         if hasattr(value, "shape"):
-            return list(value.shape)
+             return [self.world.lit_nat(d) if isinstance(d, int) else d for d in value.shape]
+             
         raise TypeError(f"shape_of does not support {type(value)}")
 
     def _remember_shape(self, value, dims):
@@ -90,7 +121,7 @@ class OperatorLibrary:
                     normalized.append(self.world.lit_nat(dim))
                 else:
                     normalized.append(dim)
-            self._shape_cache[id(value)] = normalized
+            self._shape_cache[value] = normalized
         return value
 
     def _shape_dims(self, tensor_def):
@@ -101,78 +132,8 @@ class OperatorLibrary:
             tensor_type = tensor_type.body()
         return dims
 
-    def _dim_literal_value(self, dim):
-        if isinstance(dim, mim.Lit) and hasattr(dim, "get_nat"):
-            return dim.get_nat()
-        return None
-
-    def _is_dim_one(self, dim):
-        return self._dim_literal_value(dim) == 1
-
-    def _same_dim(self, lhs, rhs):
-        lhs_value = self._dim_literal_value(lhs)
-        rhs_value = self._dim_literal_value(rhs)
-        if lhs_value is not None and rhs_value is not None:
-            return lhs_value == rhs_value
-        return lhs == rhs
-
-    def _same_shape_dims(self, lhs_dims, rhs_dims):
-        return len(lhs_dims) == len(rhs_dims) and all(
-            self._same_dim(lhs_dim, rhs_dim)
-            for lhs_dim, rhs_dim in zip(lhs_dims, rhs_dims)
-        )
-
-    def _broadcast_dim(self, lhs_dim, rhs_dim):
-        if self._same_dim(lhs_dim, rhs_dim):
-            return lhs_dim
-        if self._is_dim_one(lhs_dim):
-            return rhs_dim
-        if self._is_dim_one(rhs_dim):
-            return lhs_dim
-
-        lhs_value = self._dim_literal_value(lhs_dim)
-        rhs_value = self._dim_literal_value(rhs_dim)
-        if lhs_value is not None and rhs_value is not None:
-            raise NotImplementedError(
-                f"broadcast incompatible dimensions: {lhs_value} vs {rhs_value}"
-            )
-
-        # Symbolic dimensions may be equal at runtime. Keep the left-hand dim
-        # instead of rejecting dynamic-shape models prematurely.
-        return lhs_dim
-
-    def _broadcast_shape_dims(self, lhs_dims, rhs_dims):
-        out_reversed = []
-        for offset in range(1, max(len(lhs_dims), len(rhs_dims)) + 1):
-            lhs_dim = lhs_dims[-offset] if offset <= len(lhs_dims) else self.world.lit_nat(1)
-            rhs_dim = rhs_dims[-offset] if offset <= len(rhs_dims) else self.world.lit_nat(1)
-            out_reversed.append(self._broadcast_dim(lhs_dim, rhs_dim))
-        return list(reversed(out_reversed))
-
     def _apply_grouped(self, callee, args):
         return self.world.app(callee, self.world.tuple(args))
-
-    def _normalize_reduce_dims(self, dim, rank):
-        if dim is None:
-            dims = list(range(rank))
-        elif isinstance(dim, int):
-            dims = [dim]
-        elif isinstance(dim, (list, tuple)):
-            dims = list(dim)
-        else:
-            raise NotImplementedError(f"reduce dim {dim!r} is not supported")
-
-        normalized = []
-        for d in dims:
-            if not isinstance(d, int):
-                raise NotImplementedError(f"reduce dim {d!r} is not supported")
-            if d < 0:
-                d += rank
-            if d < 0 or d >= rank:
-                raise ValueError(f"reduce dim {d} out of range for rank {rank}")
-            if d not in normalized:
-                normalized.append(d)
-        return normalized
 
     def _affine_projection_lam(self, total_rank, output_rank, projections):
         vec_type = self.world.arr(self.world.lit_nat(total_rank), self.affine_index)
@@ -197,6 +158,12 @@ class OperatorLibrary:
         return tensor_type
 
     def binary(self, op, lhs, rhs, out_type=None):
+        """
+        Translates to MimIR elementwise binary operation:
+            %tensor.binary @(T_in, T_in, T_out) op @(rank, shape) (lhs, rhs)
+        Example IR:
+            %tensor.binary (%math.F (23, 8)) (%_math_arith.add (23, 8) 0) (2, (10, 20)) (lhs, rhs)
+        """
         if isinstance(rhs, (int, float)):
             if out_type is None:
                 out_type = self._tensor_element_type(lhs)
@@ -212,57 +179,54 @@ class OperatorLibrary:
         if out_type is None:
             out_type = in_type
             
+        # Broadcasting logic
         s_lhs_dims = self.shape_of(lhs)
         s_rhs_dims = self.shape_of(rhs)
-        output_dims = self._broadcast_shape_dims(s_lhs_dims, s_rhs_dims)
         
-        if not self._same_shape_dims(s_lhs_dims, output_dims):
-            lhs = self.expand(lhs, output_dims)
-        if not self._same_shape_dims(s_rhs_dims, output_dims):
-            rhs = self.expand(rhs, output_dims)
+        if not self.rules.same_shape(s_lhs_dims, s_rhs_dims):
+            output_dims = self.rules.broadcast_shape(s_lhs_dims, s_rhs_dims)
+            if not self.rules.same_shape(s_lhs_dims, output_dims):
+                lhs = self.expand(lhs, output_dims)
+            if not self.rules.same_shape(s_rhs_dims, output_dims):
+                rhs = self.expand(rhs, output_dims)
 
-        rank = self.world.lit_nat(len(output_dims))
-        shape = self.world.tuple(output_dims)
+        rank, shape = self._rank_and_shape(lhs)
         callee = self.world.annex(tensor.binary.value)
         callee = self._apply_grouped(callee, [in_type, in_type, out_type])
         callee = self.world.app(callee, op)
         callee = self._apply_grouped(callee, [rank, shape])
-        result = self.world.app(callee, [lhs, rhs])
-        return self._remember_shape(result, output_dims)
+        return self.world.app(callee, [lhs, rhs])
 
     def compare(self, op, lhs, rhs):
         return self.binary(op, lhs, rhs, out_type=self.Bool)
 
     def unary(self, op, input, out_type=None):
+        """
+        Translates to MimIR elementwise unary operation:
+            %tensor.unary @(T_in, T_out) op @(rank, shape) input
+        """
         in_type = self._tensor_element_type(input)
         if out_type is None:
             out_type = in_type
         rank, shape = self._rank_and_shape(input)
-        return self._unary_with_types(
-            in_type,
-            out_type,
-            op,
-            input,
-            rank,
-            shape,
-            shape_dims=self.shape_of(input),
-        )
+        return self._unary_with_types(in_type, out_type, op, input, rank, shape)
 
-    def _unary_with_types(self, input_type, output_type, op, input, rank, shape, shape_dims=None):
+    def _unary_with_types(self, input_type, output_type, op, input, rank, shape):
         callee = self.world.annex(tensor.unary.value)
         callee = self._apply_grouped(callee, [input_type, output_type])
         callee = self.world.app(callee, op)
         callee = self._apply_grouped(callee, [rank, shape])
-        result = self.world.app(callee, input)
-        if shape_dims is not None:
-            self._remember_shape(result, shape_dims)
-        return result
+        return self.world.app(callee, input)
 
     def _f32_float_lit(self, value):
         bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
         return self.world.lit(self.F32, bits)
 
     def _f32_unary_lambda(self, callee, args_fn, ret_type=None):
+        """
+        Constructs a MimIR lambda (anonymous function) to map over elements.
+        Example: `lam v: %_math_extrema.fmax (v, 0.0)`
+        """
         if ret_type is None:
             ret_type = self.F32
         lam = self.world.mut_lam(self.F32, ret_type)
@@ -388,16 +352,20 @@ class OperatorLibrary:
 
     # Logical
     def where(self, cond, x, y):
+        """
+        Translates torch.where(cond, x, y) into MimIR's ternary selection:
+            %tensor.select @T @(rank, shape) (cond, x, y)
+        """
         cond_dims = self.shape_of(cond)
         x_dims = self.shape_of(x)
         y_dims = self.shape_of(y)
-        output_dims = self._broadcast_shape_dims(self._broadcast_shape_dims(cond_dims, x_dims), y_dims)
+        output_dims = self.rules.broadcast_shape(self.rules.broadcast_shape(cond_dims, x_dims), y_dims)
 
-        if not self._same_shape_dims(cond_dims, output_dims):
+        if not self.rules.same_shape(cond_dims, output_dims):
             cond = self.expand(cond, output_dims)
-        if not self._same_shape_dims(x_dims, output_dims):
+        if not self.rules.same_shape(x_dims, output_dims):
             x = self.expand(x, output_dims)
-        if not self._same_shape_dims(y_dims, output_dims):
+        if not self.rules.same_shape(y_dims, output_dims):
             y = self.expand(y, output_dims)
 
         tensor_type = self._tensor_element_type(x)
@@ -421,7 +389,9 @@ class OperatorLibrary:
         return self.world.tuple(out_shape_list), len(shape_arg)
 
     def expand(self, input, shape):
-        in_rank, in_shape = self._rank_and_shape(input)
+        """
+        Translates torch.expand to %tensor.broadcast_in_dim or %tensor.broadcast.
+        """
         in_dims = self.shape_of(input)
         in_rank_val = len(in_dims)
 
@@ -430,7 +400,7 @@ class OperatorLibrary:
         rank_offset = out_rank_val - in_rank_val
         resolved_shape = []
         for i, dim in enumerate(shape):
-            if dim != -1:
+            if not (isinstance(dim, int) and dim == -1):
                 resolved_shape.append(dim)
                 continue
             input_index = i - rank_offset
@@ -441,10 +411,10 @@ class OperatorLibrary:
             resolved_shape.append(in_dims[input_index])
 
         shape = resolved_shape
-        out_shape_tuple, out_rank_val = self._extract_shape(shape)
+        out_shape_tuple, _ = self._extract_shape(shape)
         out_rank = self.world.lit_nat(out_rank_val)
         
-        if self._same_shape_dims(in_dims, list(shape)):
+        if in_dims == shape:
             return input
 
         elem_type = self._tensor_element_type(input)
@@ -459,24 +429,27 @@ class OperatorLibrary:
             result = self.world.app(callee, self.world.tuple([]))
             return self._remember_shape(result, shape)
 
+        _, in_shape_tuple = self._rank_and_shape(input)
         if in_rank_val == out_rank_val:
             callee = self.world.annex(tensor.broadcast.value)
             callee = self._apply_grouped(callee, [elem_type, out_rank])
-            result = self.world.app(callee, [in_shape, out_shape_tuple, input])
-            return self._remember_shape(result, shape)
+            result = self.world.app(callee, [in_shape_tuple, out_shape_tuple, input])
         else:
             callee = self.world.annex(tensor.broadcast_in_dim.value)
-            callee = self._apply_grouped(callee, [elem_type, in_rank, out_rank])
+            callee = self._apply_grouped(callee, [elem_type, self.world.lit_nat(in_rank_val), out_rank])
             
             idx_t = self.world.type_idx(out_rank)
             offset = out_rank_val - in_rank_val
             index_mapping = [self.world.lit(idx_t, offset + i) for i in range(in_rank_val)]
             index_tuple = self.world.tuple(index_mapping)
             
-            result = self.world.app(callee, [in_shape, out_shape_tuple, input, index_tuple])
-            return self._remember_shape(result, shape)
+            result = self.world.app(callee, [in_shape_tuple, out_shape_tuple, input, index_tuple])
+        return self._remember_shape(result, shape)
 
     def full(self, shape, fill_value, dtype=None):
+        """
+        Translates torch.full to a 0-input map (%tensor.map with ni=0).
+        """
         import torch
         if dtype is None:
             dtype = torch.float32
@@ -490,7 +463,7 @@ class OperatorLibrary:
         else:
             raise NotImplementedError(f"full with dtype {dtype} is not implemented")
             
-        out_shape, out_rank_val = self._extract_shape(shape)
+        out_shape_tuple, out_rank_val = self._extract_shape(shape)
         out_rank = self.world.lit_nat(out_rank_val)
         
         callee = self.world.annex(tensor.map.value)
@@ -502,46 +475,29 @@ class OperatorLibrary:
         lam.set_body(True, scalar_def)
         
         callee = self.world.app(callee, lam)
-        callee = self.world.app(callee, self.world.tuple([out_rank, out_shape]))
+        callee = self.world.app(callee, self.world.tuple([out_rank, out_shape_tuple]))
         
         input_is = self.world.tuple([])
         result = self.world.app(callee, input_is)
         return self._remember_shape(result, shape)
 
     def _reduce_aff(self, input, output_type, reducer, init, dim=None, keepdim=False, return_shape=False):
+        """
+        Translates reduction operations into `%tensor.map_reduce_aff`.
+        Uses ShapeRules.reduce_shape_spec as the canonical source for reduce shape invariants.
+        """
         input_dims = self.shape_of(input)
         input_rank = len(input_dims)
-        reduce_dims = self._normalize_reduce_dims(dim, input_rank)
-        kept_dims = [axis for axis in range(input_rank) if axis not in reduce_dims]
+        spec = self.rules.reduce_shape_spec(input_dims, dim=dim, keepdim=keepdim)
 
-        if keepdim:
-            output_dims = [
-                self.world.lit_nat(1) if axis in reduce_dims else input_dims[axis]
-                for axis in range(input_rank)
-            ]
-            input_projections = [
-                input_rank + reduce_dims.index(axis) if axis in reduce_dims else axis
-                for axis in range(input_rank)
-            ]
-        else:
-            output_dims = [input_dims[axis] for axis in kept_dims]
-            kept_positions = {axis: pos for pos, axis in enumerate(kept_dims)}
-            input_projections = [
-                len(kept_dims) + reduce_dims.index(axis)
-                if axis in reduce_dims
-                else kept_positions[axis]
-                for axis in range(input_rank)
-            ]
-
-        output_rank = len(output_dims)
-        reduce_rank = len(reduce_dims)
-        loop_dims = output_dims + [input_dims[axis] for axis in reduce_dims]
+        output_rank = len(spec.output_dims)
+        reduce_rank = len(spec.reduce_dims)
         total_rank = output_rank + reduce_rank
 
         callee = self.world.annex(tensor.map_reduce_aff.value)
-        callee = self.world.app(callee, self.world.lit_nat(1))
+        callee = self.world.app(callee, self.world.lit_nat(1)) # nis = 1 input tensor
         callee = self._apply_grouped(callee, [output_type, self.world.lit_nat(output_rank), self.world.lit_nat(reduce_rank)])
-        callee = self._apply_grouped(callee, [self.world.tuple(output_dims), self.world.tuple(loop_dims)])
+        callee = self._apply_grouped(callee, [self.world.tuple(spec.output_dims), self.world.tuple(spec.loop_dims)])
         
         in_elem_type = self._tensor_element_type(input)
         callee = self._apply_grouped(
@@ -560,19 +516,28 @@ class OperatorLibrary:
         callee = self.world.app(
             callee,
             self.world.tuple(
-                [self._affine_projection_lam(total_rank, input_rank, input_projections)]
+                [self._affine_projection_lam(total_rank, input_rank, spec.input_projections)]
             ),
         )
         result = self.world.app(callee, self.world.tuple([input]))
-        self._remember_shape(result, output_dims)
+        
+        # 2. Record the truth of the resulting shape
+        self._remember_shape(result, spec.output_dims)
+        
         if return_shape:
-            return result, output_dims
+            return result, spec.output_dims
         return result
 
     def sum(self, input, dim=None, keepdim=False):
+        """
+        Translates to a summation via `%tensor.map_reduce_aff`.
+        """
         return self._reduce_aff(input, self.F32, self._f32_reduce_lambda(self.f32_add_axm), self._f32_float_lit(0.0), dim=dim, keepdim=keepdim)
 
     def amax(self, input, dim=None, keepdim=False):
+        """
+        Translates to maximum reduction via `%tensor.map_reduce_aff`.
+        """
         return self._reduce_aff(input, self.F32, self._f32_reduce_lambda(self.f32_max_axm), self._f32_float_lit(-float("inf")), dim=dim, keepdim=keepdim)
 
     def _f32_pair_reduce_lambda(self, pair_type):
@@ -587,6 +552,9 @@ class OperatorLibrary:
         return lam
 
     def mean(self, input, dim=None, keepdim=False):
+        """
+        Translates to mean reduction.
+        """
         pair_type = self.world.arr(self.world.lit_nat(2), self.F32)
         reduced, output_dims = self._reduce_aff(
             input,
@@ -606,16 +574,11 @@ class OperatorLibrary:
             reduced,
             rank,
             shape,
-            shape_dims=output_dims,
         )
 
     def _f32_var_mean_reduce_lambda(self, acc_type):
         """
         Creates the reduction lambda for var_mean which maintains (sum, sum_sq, count).
-        Effectively:
-          def reducer(acc, value):
-              sum_acc, sum_sq_acc, count_acc = acc
-              return (sum_acc + value, sum_sq_acc + value*value, count_acc + 1)
         """
         args_type = self.world.sigma([acc_type, self.F32])
         lam = self.world.mut_con([args_type, self.world.cn([acc_type])])
@@ -640,9 +603,6 @@ class OperatorLibrary:
     def _f32_acc_to_var_mean(self, acc_type, extract_var=True):
         """
         Finalizer map step for var_mean.
-        Extracts `mean` or `var` from the accumulator tuple:
-          mean = sum / count
-          var = (sum_sq / count) - (mean * mean)
         """
         lam = self.world.mut_lam(acc_type, self.F32)
         acc = lam.var()
@@ -665,11 +625,6 @@ class OperatorLibrary:
     def var_mean(self, input, dim=None, keepdim=False, correction=0):
         """
         Translates torch.var_mean into a map-reduce operation that yields a tuple (var, mean).
-        
-        MimIR Pipeline:
-        1. Uses `%tensor.map_reduce_aff` to accumulate `(sum, sum_sq, count)` into a 3-element array.
-        2. Projects this accumulator tensor into `var` and `mean` using two separate `%tensor.unary` operations.
-        3. Returns a MimIR tuple containing the two resulting tensors.
         """
         if correction != 0:
             raise NotImplementedError("var_mean with correction != 0 is not implemented")
@@ -688,33 +643,17 @@ class OperatorLibrary:
         rank = self.world.lit_nat(len(output_dims))
         shape = self.world.tuple(output_dims)
         
-        var_tensor = self._unary_with_types(
-            acc_type,
-            self.F32,
-            self._f32_acc_to_var_mean(acc_type, extract_var=True),
-            reduced,
-            rank,
-            shape,
-            shape_dims=output_dims,
-        )
-        mean_tensor = self._unary_with_types(
-            acc_type,
-            self.F32,
-            self._f32_acc_to_var_mean(acc_type, extract_var=False),
-            reduced,
-            rank,
-            shape,
-            shape_dims=output_dims,
-        )
+        var_tensor = self._unary_with_types(acc_type, self.F32, self._f32_acc_to_var_mean(acc_type, extract_var=True), reduced, rank, shape)
+        mean_tensor = self._unary_with_types(acc_type, self.F32, self._f32_acc_to_var_mean(acc_type, extract_var=False), reduced, rank, shape)
         
         return self.world.tuple([var_tensor, mean_tensor])
 
     # Linear Algebra
-    # Linear Algebra
     def mm(self, lhs, rhs):
         # Ring: [T: *, _0: T, add: [T, T] -> T, mul: [T, T] -> T]
         ring = self.world.tuple([self.F32, self._f32_float_lit(0.0), self.f32_add_axm, self.f32_mul_axm])
-        callee = self.world.annex(tensor.product_2d.value)
+        # 0x5463d44130001300 is product_2d
+        callee = self.world.annex(0x5463d44130001300)
         callee = self.world.app(callee, ring)
         return self.world.implicit_app(callee, [lhs, rhs])
 
@@ -723,14 +662,17 @@ class OperatorLibrary:
 
     # Injective
     def reshape(self, x, shape):
-        in_rank, in_shape = self._rank_and_shape(x)
+        """
+        Translates to `%tensor.reshape`.
+        """
+        in_rank, in_shape_tuple = self._rank_and_shape(x)
         out_shape_tuple, out_rank_val = self._extract_shape(shape)
         out_rank = self.world.lit_nat(out_rank_val)
         elem_t = self._tensor_element_type(x)
 
         callee = self.world.annex(tensor.reshape.value)
         callee = self._apply_grouped(callee, [elem_t, in_rank, out_rank])
-        callee = self.world.app(callee, in_shape)
+        callee = self.world.app(callee, in_shape_tuple)
         callee = self.world.app(callee, out_shape_tuple)
         result = self.world.app(callee, x)
         return self._remember_shape(result, list(shape))
@@ -739,49 +681,29 @@ class OperatorLibrary:
         return self.reshape(x, shape)
 
     def slice(self, x, dim, start, end, step=1):
-        rank, in_shape = self._rank_and_shape(x)
+        """
+        Translates to `%tensor.slice`.
+        """
+        rank, in_shape_tuple = self._rank_and_shape(x)
         in_dims = self.shape_of(x)
         rank_val = len(in_dims)
         elem_t = self._tensor_element_type(x)
 
         if dim < 0: dim += rank_val
         
-        starts = []
-        steps = []
-        out_dims = []
+        # 1. Canonical shape transformation
+        out_dims = self.rules.slice_shape(in_dims, dim, start, end, step)
         
-        for i in range(rank_val):
-            if i == dim:
-                s_in = in_dims[i]
-                is_static = isinstance(start, int) and (end is None or isinstance(end, int)) and isinstance(step, int)
-                
-                actual_start = self.world.lit_nat(start) if isinstance(start, int) else start
-                actual_step = self.world.lit_nat(step) if isinstance(step, int) else (self.world.lit_nat(1) if step is None else step)
-                
-                if end is None or (isinstance(end, int) and end > 1000000000):
-                    actual_end = s_in
-                else:
-                    actual_end = self.world.lit_nat(end) if isinstance(end, int) else end
-                
-                starts.append(actual_start)
-                steps.append(actual_step)
-                
-                if is_static:
-                    v_step = step if step is not None else 1
-                    if end is None:
-                        out_dims.append(self.world.top_nat())
-                    else:
-                        out_dims.append(self.world.lit_nat((end - start + v_step - 1) // v_step))
-                else:
-                    out_dims.append(self.world.top_nat())
-            else:
-                starts.append(self.world.lit_nat(0))
-                steps.append(self.world.lit_nat(1))
-                out_dims.append(in_dims[i])
+        # 2. Prep start/step tuples for MimIR
+        starts = [self.world.lit_nat(0)] * rank_val
+        steps = [self.world.lit_nat(1)] * rank_val
         
+        starts[dim] = self.world.lit_nat(start) if isinstance(start, int) else start
+        steps[dim] = self.world.lit_nat(step) if isinstance(step, int) else (self.world.lit_nat(1) if step is None else step)
+
         callee = self.world.annex(tensor.slice.value)
         callee = self._apply_grouped(callee, [elem_t, rank])
-        callee = self.world.app(callee, in_shape)
+        callee = self.world.app(callee, in_shape_tuple)
         
         callee = self.world.app(callee, self.world.tuple([
             self.world.tuple(starts),
@@ -792,13 +714,27 @@ class OperatorLibrary:
         return self._remember_shape(result, out_dims)
 
     def cat(self, tensors, dim=0):
+        """
+        Translates to `%tensor.concat`.
+        """
         num_inputs = tensors.num_projs()
         first_tensor = tensors.proj(num_inputs, 0)
         rank, _ = self._rank_and_shape(first_tensor)
-        rank_val = len(self.shape_of(first_tensor))
+        rank_val = len(self._shape_dims(first_tensor))
         elem_t = self._tensor_element_type(first_tensor)
         
         if dim < 0: dim += rank_val
+        
+        # 1. Canonical shape transformation
+        input_shapes = []
+        input_dims_list = []
+        for i in range(num_inputs):
+            t = tensors.proj(num_inputs, i)
+            input_dims = self.shape_of(t)
+            input_dims_list.append(input_dims)
+            input_shapes.append(self.world.tuple(input_dims))
+            
+        out_dims = self.rules.concat_shape(input_dims_list, dim)
         
         callee = self.world.annex(tensor.concat.value)
         callee = self._apply_grouped(callee, [elem_t, self.world.lit_nat(num_inputs), rank])
@@ -807,25 +743,27 @@ class OperatorLibrary:
         ax = self.world.lit(idx_t, dim)
         callee = self.world.app(callee, ax)
         
-        input_shapes = []
-        for i in range(num_inputs):
-            _, s = self._rank_and_shape(tensors.proj(num_inputs, i))
-            input_shapes.append(s)
-        
         callee = self.world.app(callee, self.world.tuple(input_shapes))
         result = self.world.app(callee, tensors)
-        return result
+        return self._remember_shape(result, out_dims)
 
     def transpose(self, x, permutation):
-        rank, shape = self._rank_and_shape(x)
+        """
+        Translates to `%tensor.transpose`.
+        """
+        rank_val, in_shape_tuple = self._rank_and_shape(x)
+        in_dims = self.shape_of(x)
         elem_t = self._tensor_element_type(x)
-        idx_t = self.world.type_idx(rank)
+        
+        # Canonical shape transformation
+        out_dims = self.rules.transpose_shape(in_dims, permutation)
+        
+        idx_t = self.world.type_idx(rank_val)
         perm_mim = self.world.tuple([self.world.lit(idx_t, p) for p in permutation])
         
         callee = self.world.annex(tensor.transpose.value)
-        callee = self._apply_grouped(callee, [elem_t, rank, shape])
+        callee = self._apply_grouped(callee, [elem_t, rank_val, in_shape_tuple])
         result = self.world.app(callee, [x, perm_mim])
-        out_dims = [self.shape_of(x)[p] for p in permutation]
         return self._remember_shape(result, out_dims)
 
     def _is_one(self, d):
@@ -833,57 +771,61 @@ class OperatorLibrary:
         return d == self.world.lit_nat(1)
 
     def squeeze(self, x, dim=None):
+        """
+        Translates to `reshape` with the canonical `squeeze_shape`.
+        """
         in_dims = self.shape_of(x)
-        if dim is None:
-            out_dims = [d for d in in_dims if not self._is_one(d)]
-        else:
-            if dim < 0: dim += len(in_dims)
-            out_dims = []
-            for i, d in enumerate(in_dims):
-                if i == dim:
-                    if not self._is_one(d):
-                         out_dims.append(d)
-                else:
-                    out_dims.append(d)
+        out_dims = self.rules.squeeze_shape(in_dims, dim)
         return self.reshape(x, out_dims)
 
     def unsqueeze(self, x, dim):
+        """
+        Translates to `reshape` with the canonical `unsqueeze_shape`.
+        """
         in_dims = self.shape_of(x)
-        if dim < 0: dim += len(in_dims) + 1
-        out_dims = list(in_dims)
-        out_dims.insert(dim, 1)
+        out_dims = self.rules.unsqueeze_shape(in_dims, dim)
         return self.reshape(x, out_dims)
 
     def split(self, x, split_size_or_sections, dim=0):
+        """
+        Translates to multiple `slice` operations.
+        """
         in_dims = self.shape_of(x)
         rank_val = len(in_dims)
         if dim < 0: dim += rank_val
         
         extent = in_dims[dim]
-        extent_value = self._dim_literal_value(extent)
+        extent_val = self.rules._dim_literal_value(extent)
+        
+        output_shapes = self.rules.split_shapes(in_dims, split_size_or_sections, dim)
         slices = []
+        curr = 0
         if isinstance(split_size_or_sections, int):
             split_size = split_size_or_sections
-            if extent_value is not None:
-                curr = 0
-                while curr < extent_value:
-                    end = min(curr + split_size, extent_value)
-                    slices.append(self.slice(x, dim, curr, end))
-                    curr = end
-            else:
+            if extent_val is None:
                 raise NotImplementedError("Dynamic split by size not supported")
-        else:
-            curr = 0
-            for size in split_size_or_sections:
-                end = curr + size
+            while curr < extent_val:
+                end = min(curr + split_size, extent_val)
                 slices.append(self.slice(x, dim, curr, end))
+                curr = end
+        else:
+            for size, out_shape in zip(split_size_or_sections, output_shapes):
+                end = curr + size
+                part = self.slice(x, dim, curr, end)
+                self._remember_shape(part, out_shape)
+                slices.append(part)
                 curr = end
         
         return self.world.tuple(slices)
         
     def select(self, x, dim, index):
+        """
+        Translates to `slice` followed by `squeeze`.
+        """
+        # slice(index, index + 1) then squeeze(dim)
         sliced = self.slice(x, dim, index, index + 1, 1)
-        return self.squeeze(sliced, dim)
+        result = self.squeeze(sliced, dim)
+        return self._remember_shape(result, self.rules.select_shape(self.shape_of(x), dim))
 
     def clone(self, x): return x
     def copy(self, x): return x

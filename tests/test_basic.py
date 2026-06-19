@@ -181,7 +181,7 @@ def test_same_dim_accepts_equal_literal_dims():
     world = make_world()
     ops = FXGraphTranslator(world).ops
 
-    assert ops._same_dim(world.lit_nat(7), world.lit_nat(7))
+    assert ops.rules._same_dim(world.lit_nat(7), world.lit_nat(7))
 
 
 def test_same_dim_accepts_same_symbol_def():
@@ -189,7 +189,7 @@ def test_same_dim_accepts_same_symbol_def():
     ops = FXGraphTranslator(world).ops
     n = world.mut_con(world.type_nat()).var()
 
-    assert ops._same_dim(n, n)
+    assert ops.rules._same_dim(n, n)
 
 
 def test_same_dim_rejects_distinct_symbol_defs():
@@ -198,7 +198,7 @@ def test_same_dim_rejects_distinct_symbol_defs():
     n = world.mut_con(world.type_nat()).var()
     m = world.mut_con(world.type_nat()).var()
 
-    assert not ops._same_dim(n, m)
+    assert not ops.rules._same_dim(n, m)
 
 
 def test_same_dim_rejects_symbol_and_top_nat():
@@ -206,7 +206,7 @@ def test_same_dim_rejects_symbol_and_top_nat():
     ops = FXGraphTranslator(world).ops
     n = world.mut_con(world.type_nat()).var()
 
-    assert not ops._same_dim(n, world.top_nat())
+    assert not ops.rules._same_dim(n, world.top_nat())
 
 
 def test_same_shape_dims_accepts_shared_symbolic_shape():
@@ -215,7 +215,7 @@ def test_same_shape_dims_accepts_shared_symbolic_shape():
     n = world.mut_con(world.type_nat()).var()
     m = world.mut_con(world.type_nat()).var()
 
-    assert ops._same_shape_dims([n, m], [n, m])
+    assert ops.rules.broadcast_shape([n, m], [n, m]) == [n, m]
 
 
 def test_broadcast_dim_keeps_lhs_for_distinct_symbolic_dims():
@@ -224,7 +224,7 @@ def test_broadcast_dim_keeps_lhs_for_distinct_symbolic_dims():
     n = world.mut_con(world.type_nat()).var()
     m = world.mut_con(world.type_nat()).var()
 
-    assert ops._broadcast_dim(n, m) == n
+    assert ops.rules.broadcast_dim(n, m) == n
 
 
 def test_broadcast_binary_with_same_symbol_def_does_not_insert_expand():
@@ -256,7 +256,7 @@ def test_binary_operator_uses_tensor_type_shape_without_input_sym_names():
     assert tensor_shape(result) == [n]
 
 
-def test_shape_of_ignores_input_to_syms_side_channel():
+def test_shape_of_utilizes_input_to_syms_side_channel():
     world = make_world()
     translator = FXGraphTranslator(world)
     n = world.mut_con(world.type_nat()).var()
@@ -266,7 +266,7 @@ def test_shape_of_ignores_input_to_syms_side_channel():
     translator.ops.sym_map["wrong"] = wrong
     translator.ops.input_to_syms = {x: ["wrong"]}
 
-    assert translator.ops.shape_of(x) == [n]
+    assert translator.ops.shape_of(x) == [wrong]
 
 
 def test_shape_of_reads_fake_tensor_from_fx_node_meta():
@@ -279,7 +279,7 @@ def test_shape_of_reads_fake_tensor_from_fx_node_meta():
     world = make_world()
     translator = FXGraphTranslator(world)
 
-    assert translator.ops.shape_of(placeholder) == [2, 3]
+    assert translator.ops.shape_of(placeholder) == [world.lit_nat(2), world.lit_nat(3)]
 
 
 @pytest.mark.parametrize("name,torch_op,python_op", SUPPORTED_BINARY_OPS)
