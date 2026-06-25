@@ -29,12 +29,27 @@ def make_world() -> mim.World:
     return driver.world()
 
 
-def load_inductor_graph_module(case_or_path: str | Path, root: Path = DEFAULT_INDUCTOR_LOG_ROOT) -> fx.GraphModule:
-    path = Path(case_or_path)
+def load_inductor_graph_module(
+    case_or_path: str | Path,
+    root: Path = DEFAULT_INDUCTOR_LOG_ROOT,
+) -> fx.GraphModule:
+    """
+    Load an inductor log generated fx_graph_readable.py as a fx.GraphModule.
+    Args:
+        case_or_path: name of the case in the inductor logs, e.g. "mlp_1", or the path to the fx_graph_readable.py.
+    """
+    if isinstance(case_or_path, str) and not case_or_path.endswith(".py"):
+        path = root / case_or_path / "fx_graph_readable.py"
+    else:
+        path = Path(case_or_path)
+
     if not path.exists():
-        path = root / str(case_or_path) / "fx_graph_readable.py"
+        raise FileNotFoundError(f"{path} not found")
+
+    content = path.read_text()
+    content = content.replace("class <lambda>(torch.nn.Module):", "class GraphModule(torch.nn.Module):")
     namespace = {"torch": torch, "device": torch.device}
-    exec(path.read_text(), namespace)
+    exec(content, namespace)
     return fx.symbolic_trace(namespace["GraphModule"]())
 
 
@@ -103,12 +118,40 @@ def make_mimir_inputs_from_annotations(world: mim.World, graph_module: fx.GraphM
     return inputs
 
 
-def translate_inductor_readable(case_or_path: str | Path, root: Path = DEFAULT_INDUCTOR_LOG_ROOT) -> mim.Def:
+import inspect
+
+def translate_inductor_readable(case_or_path: str | Path, root: Path = DEFAULT_INDUCTOR_LOG_ROOT, as_function: bool = False) -> mim.Def:
     graph_module = load_inductor_graph_module(case_or_path, root=root)
     world = make_world()
     translator = FXGraphTranslator(world, module=graph_module)
     inputs = make_mimir_inputs_from_annotations(world, graph_module)
-    return translator.translate(graph_module.graph, inputs)
+    
+    if not as_function:
+        return translator.translate(graph_module.graph, inputs)
+
+    num_params = len(inputs) + 1
+    dom_with_ret = world.mut_sigma(num_params)
+    for i, inp in enumerate(inputs):
+        dom_with_ret.set(i, inp.type())
+        
+    lam = world.mut_con(dom_with_ret)
+    lam.set("main")
+    
+    actual_inputs = [lam.var().proj(num_params, i) for i in range(len(inputs))]
+    
+    parameters = list(inspect.signature(graph_module.forward).parameters.keys())
+    for i, actual_input in enumerate(actual_inputs):
+        if i < len(parameters):
+            actual_input.set(parameters[i])
+
+    result = translator.translate(graph_module.graph, actual_inputs)
+    
+    dom_with_ret.set(num_params - 1, world.cn([result.type()]))
+    ret_cont = lam.var().proj(num_params, num_params - 1)
+    lam.app(True, ret_cont, [result])
+    lam.externalize()
+    
+    return lam
 
 
 def translate_inductor_readable_prefix(

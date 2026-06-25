@@ -49,6 +49,7 @@ class OperatorLibrary:
         self.f32_log_axm = bind_math_axm(_math_exp.log)
         self.f32_tanh_axm = bind_math_axm(_math_tri.tanh)
         self.f32_sqrt_axm = bind_math_axm(_math_rt.sq)
+        self.f32_pow_axm = bind_math_axm(math.pow)
         self.f32_abs_axm = bind_math_axm(math.abs)
         self.f32_neg_axm = bind_math_axm(math.minus)
         
@@ -195,7 +196,10 @@ class OperatorLibrary:
         callee = self._apply_grouped(callee, [in_type, in_type, out_type])
         callee = self.world.app(callee, op)
         callee = self._apply_grouped(callee, [rank, shape])
-        return self.world.app(callee, [lhs, rhs])
+        res = self.world.app(callee, [lhs, rhs])
+        
+        output_dims = self.rules.broadcast_shape(s_lhs_dims, s_rhs_dims)
+        return self._remember_shape(res, output_dims)
 
     def compare(self, op, lhs, rhs):
         return self.binary(op, lhs, rhs, out_type=self.Bool)
@@ -209,7 +213,8 @@ class OperatorLibrary:
         if out_type is None:
             out_type = in_type
         rank, shape = self._rank_and_shape(input)
-        return self._unary_with_types(in_type, out_type, op, input, rank, shape)
+        res = self._unary_with_types(in_type, out_type, op, input, rank, shape)
+        return self._remember_shape(res, self.shape_of(input))
 
     def _unary_with_types(self, input_type, output_type, op, input, rank, shape):
         callee = self.world.annex(tensor.unary.value)
@@ -245,6 +250,7 @@ class OperatorLibrary:
     def sub(self, lhs, rhs): return self.binary(self.f32_sub_axm, lhs, rhs)
     def mul(self, lhs, rhs): return self.binary(self.f32_mul_axm, lhs, rhs)
     def div(self, lhs, rhs): return self.binary(self.f32_div_axm, lhs, rhs)
+    def pow(self, lhs, rhs): return self.binary(self.f32_pow_axm, lhs, rhs)
     
     # Comparison
     def eq(self, lhs, rhs): return self.compare(self.f32_eq_axm, lhs, rhs)
@@ -567,7 +573,7 @@ class OperatorLibrary:
         )
         rank = self.world.lit_nat(len(output_dims))
         shape = self.world.tuple(output_dims)
-        return self._unary_with_types(
+        res = self._unary_with_types(
             pair_type,
             self.F32,
             self._f32_pair_to_mean_lambda(pair_type),
@@ -575,6 +581,7 @@ class OperatorLibrary:
             rank,
             shape,
         )
+        return self._remember_shape(res, output_dims)
 
     def _f32_var_mean_reduce_lambda(self, acc_type):
         """
@@ -644,7 +651,9 @@ class OperatorLibrary:
         shape = self.world.tuple(output_dims)
         
         var_tensor = self._unary_with_types(acc_type, self.F32, self._f32_acc_to_var_mean(acc_type, extract_var=True), reduced, rank, shape)
+        self._remember_shape(var_tensor, output_dims)
         mean_tensor = self._unary_with_types(acc_type, self.F32, self._f32_acc_to_var_mean(acc_type, extract_var=False), reduced, rank, shape)
+        self._remember_shape(mean_tensor, output_dims)
         
         return self.world.tuple([var_tensor, mean_tensor])
 

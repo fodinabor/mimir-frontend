@@ -25,6 +25,7 @@ class FXGraphTranslator:
             (torch.sub, operator.sub, ["aten.sub.default", "aten.sub.Tensor", "aten.sub.Scalar"], self.ops.sub),
             (torch.mul, operator.mul, ["aten.mul.default", "aten.mul.Tensor", "aten.mul.Scalar"], self.ops.mul),
             (torch.div, operator.truediv, ["aten.div.default", "aten.div.Tensor", "aten.div.Scalar"], self.ops.div),
+            (torch.pow, operator.pow, ["aten.pow.default", "aten.pow.Tensor_Tensor", "aten.pow.Tensor_Scalar"], self.ops.pow),
             (torch.maximum, None, ["aten.maximum.default"], self.ops.maximum),
             (torch.minimum, None, ["aten.minimum.default"], self.ops.minimum),
             (torch.eq, operator.eq, ["aten.eq.default", "aten.eq.Tensor", "aten.eq.Scalar"], self.ops.eq),
@@ -461,17 +462,22 @@ class FXGraphTranslator:
 
         # Map placeholders to first part of inputs
         for node, arg in zip(placeholders, inputs[:len(placeholders)]):
+            arg.set(node.name)
             self.env[node] = arg
 
         # Map get_attr to the rest of inputs
         for node, arg in zip(param_nodes, inputs[len(placeholders):]):
+            arg.set(node.name)
             self.env[node] = arg
 
         for node in graph.nodes:
             if node.op in ("placeholder", "get_attr"):
                 continue
             elif node.op in ("call_function", "call_method"):
-                self.env[node] = self.convert_node(node)
+                res = self.convert_node(node)
+                if isinstance(res, (mim.Lam, mim.App)):
+                    res.set(node.name)
+                self.env[node] = res
             elif node.op == "output":
                 res = node.args[0]
                 if isinstance(res, fx.Node):

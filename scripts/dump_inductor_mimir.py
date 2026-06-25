@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=DEFAULT_INDUCTOR_LOG_ROOT)
     parser.add_argument("--partial", action="store_true", help="Print the last successfully translated node on failure.")
     parser.add_argument("--max-depth", type=int, default=100)
+    parser.add_argument("--as-function", action="store_true", help="Wrap output in a function (Lam)")
     parser.add_argument("--out", type=Path, help="Write IR to this file instead of stdout.")
     return parser.parse_args()
 
@@ -43,10 +44,12 @@ def main() -> int:
     args = parse_args()
 
     try:
-        result = translate_inductor_readable(args.case, root=args.root)
+        result = translate_inductor_readable(args.case, root=args.root, as_function=args.as_function)
         emit(def_to_string(result, args.max_depth), args.out)
         return 0
     except Exception as exc:
+        import traceback
+        traceback.print_exc()
         if not args.partial:
             print(f"translation failed at current frontier: {exc}", file=sys.stderr)
             print("rerun with --partial to dump the last successfully translated MimIR node", file=sys.stderr)
