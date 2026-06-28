@@ -9,6 +9,7 @@ import tempfile
 import mim
 import torch
 from torch import fx
+from mim._plugins.compile import compile as mim_compile
 
 from .translator import FXGraphTranslator
 
@@ -111,7 +112,7 @@ def _make_driver(compile_phase: str) -> mim.Driver:
     driver = mim.Driver()
     plugins = ["math", "tensor"]
     if compile_phase == "default":
-        plugins.extend(["compile", "opt"])
+        plugins.append("compile")
     driver.load_plugins(plugins)
     return driver
 
@@ -132,6 +133,234 @@ def _write_def_to_string(defn: mim.Def, name: str, max_depth: int) -> str:
         path = tmp_dir / f"{name}.mim"
         defn.write(max_depth, str(path))
         return path.read_text()
+
+
+def _write_defs_to_string(defs: Sequence[tuple[str, mim.Def]], max_depth: int) -> str:
+    rendered = []
+    for name, defn in defs:
+        rendered.append(_write_def_to_string(defn, name, max_depth).rstrip())
+    return "\n\n".join(rendered) + "\n"
+
+
+def _mimir_i8_string(world: mim.World, text: str) -> mim.Def:
+    return world.tuple([world.lit_i8(ord(ch)) for ch in text])
+
+
+def _named_phase(world: mim.World, name: str) -> mim.Def:
+    return world.implicit_app(world.annex(mim_compile.named_phase.value), _mimir_i8_string(world, name))
+
+
+def _named_pass(world: mim.World, name: str) -> mim.Def:
+    return world.implicit_app(world.annex(mim_compile.named_pass.value), _mimir_i8_string(world, name))
+
+
+def _named_repl(world: mim.World, name: str) -> mim.Def:
+    return world.implicit_app(world.annex(mim_compile.named_repl.value), _mimir_i8_string(world, name))
+
+
+def _compile_phases(world: mim.World, loop: bool, phases: Sequence[mim.Def]) -> mim.Def:
+    callee = world.implicit_app(world.annex(mim_compile.phases.value), world.lit_bool(loop))
+    return world.implicit_app(callee, world.tuple(list(phases)))
+
+
+def _compile_passes(world: mim.World, passes: Sequence[mim.Def]) -> mim.Def:
+    return world.implicit_app(world.annex(mim_compile.passes.value), world.tuple(list(passes)))
+
+
+def _compile_repls(world: mim.World, repls: Sequence[mim.Def]) -> mim.Def:
+    return world.implicit_app(world.annex(mim_compile.repls.value), world.tuple(list(repls)))
+
+
+def _pass_to_phase(world: mim.World, compile_pass: mim.Def) -> mim.Def:
+    return world.implicit_app(world.annex(mim_compile.pass2phase.value), compile_pass)
+
+
+def _repl_to_phase(world: mim.World, compile_repl: mim.Def) -> mim.Def:
+    return world.implicit_app(world.annex(mim_compile.repl2phase.value), compile_repl)
+
+
+def _cond_phase(world: mim.World, plugin_name: str, phase: mim.Def) -> mim.Def:
+    callee = world.implicit_app(world.annex(mim_compile.cond_phase.value), _mimir_i8_string(world, plugin_name))
+    return world.implicit_app(callee, phase)
+
+
+def _eta_red_pass(world: mim.World, aggressive: bool) -> mim.Def:
+    return world.implicit_app(world.annex(mim_compile.eta_red_pass.value), world.lit_bool(aggressive))
+
+
+def _default_compile_phase(world: mim.World) -> mim.Def:
+    optimization_passes = _compile_passes(
+        world,
+        [
+            world.annex(mim_compile.beta_red_pass.value),
+            _eta_red_pass(world, False),
+            world.annex(mim_compile.eta_exp_pass.value),
+            world.annex(mim_compile.scalarize_pass.value),
+            world.annex(mim_compile.tail_rec_elim_pass.value),
+        ],
+    )
+    optimization_phase = _pass_to_phase(world, optimization_passes)
+
+    mem_opt_passes = _compile_passes(
+        world,
+        [
+            _named_pass(world, "%mem.ssa_pass"),
+            _named_pass(world, "%mem.copy_prop_ff_pass"),
+        ],
+    )
+
+    direct_phases = _compile_phases(
+        world,
+        False,
+        [
+            _named_phase(world, "%direct.ds2cps_phase"),
+            _named_phase(world, "%direct.cps2ds_phase"),
+            optimization_phase,
+        ],
+    )
+
+    matrix_lower_phase = _compile_phases(
+        world,
+        False,
+        [
+            _pass_to_phase(
+                world,
+                _compile_passes(
+                    world,
+                    [
+                        _named_pass(world, "%matrix.lower_matrix_high_level_map_reduce"),
+                        _named_pass(world, "%matrix.lower_matrix_medium_level"),
+                    ],
+                ),
+            ),
+            _named_phase(world, "%matrix.lower_matrix_low_level"),
+        ],
+    )
+
+    clos_opt1_passes = _compile_passes(
+        world,
+        [
+            _eta_red_pass(world, True),
+            world.annex(mim_compile.eta_exp_pass.value),
+            world.annex(mim_compile.scalarize_pass.value),
+        ],
+    )
+    clos_opt2_passes = _compile_passes(
+        world,
+        [
+            world.annex(mim_compile.scalarize_pass.value),
+            _named_pass(world, "%clos.branch_clos_pass"),
+            _named_pass(world, "%mem.copy_prop_tt_pass"),
+            _named_pass(world, "%clos.lower_typed_clos_prep_pass"),
+            _named_pass(world, "%clos.clos2sjlj_pass"),
+        ],
+    )
+    clos_phases = _compile_phases(
+        world,
+        False,
+        [
+            optimization_phase,
+            _pass_to_phase(world, _named_pass(world, "%mem.reshape_flat_pass")),
+            _named_phase(world, "%mem.add_mem_phase"),
+            _pass_to_phase(world, _named_pass(world, "%clos.clos_conv_prep_pass")),
+            _pass_to_phase(world, world.annex(mim_compile.eta_exp_pass.value)),
+            _named_phase(world, "%clos.clos_conv_phase"),
+            _pass_to_phase(world, clos_opt1_passes),
+            _pass_to_phase(world, clos_opt2_passes),
+            _named_phase(world, "%clos.lower_typed_clos_phase"),
+        ],
+    )
+
+    return _compile_phases(
+        world,
+        False,
+        [
+            _pass_to_phase(world, world.annex(mim_compile.scalarize_pass.value)),
+            _pass_to_phase(world, _eta_red_pass(world, False)),
+            _pass_to_phase(world, world.annex(mim_compile.tail_rec_elim_pass.value)),
+            _pass_to_phase(world, _named_pass(world, "%regex.lower_regex")),
+            _compile_phases(
+                world,
+                True,
+                [
+                    world.annex(mim_compile.beta_red_phase.value),
+                    world.annex(mim_compile.eta_red_phase.value),
+                ],
+            ),
+            world.annex(mim_compile.eta_exp_phase.value),
+            world.annex(mim_compile.sym_expr_opt.value),
+            _cond_phase(
+                world,
+                "tensor",
+                _compile_phases(
+                    world,
+                    False,
+                    [
+                        _named_phase(world, "%tensor.lower_tensor"),
+                        _named_phase(world, "%tensor.fuse_tensor"),
+                        _named_phase(world, "%tensor.lower_map_reduce"),
+                        _named_phase(world, "%tensor.lower_get_set"),
+                    ],
+                ),
+            ),
+            _named_phase(world, "%affine.lower_index_phase"),
+            _named_phase(world, "%affine.lower_for_phase"),
+            _pass_to_phase(world, _compile_passes(world, [optimization_passes, mem_opt_passes])),
+            _cond_phase(
+                world,
+                "autodiff",
+                _compile_phases(
+                    world,
+                    False,
+                    [
+                        _pass_to_phase(world, _named_pass(world, "%autodiff.eval_pass")),
+                        _repl_to_phase(world, _named_repl(world, "%autodiff.zero_repl")),
+                    ],
+                ),
+            ),
+            _cond_phase(world, "direct", direct_phases),
+            _cond_phase(
+                world,
+                "matrix",
+                _compile_phases(
+                    world,
+                    False,
+                    [
+                        matrix_lower_phase,
+                        _cond_phase(world, "direct", direct_phases),
+                    ],
+                ),
+            ),
+            _named_phase(world, "%affine.lower_for_phase"),
+            world.annex(mim_compile.internal_cleanup_phase.value),
+            _cond_phase(world, "clos", clos_phases),
+            _pass_to_phase(world, world.annex(mim_compile.lam_spec_pass.value)),
+            world.annex(mim_compile.branch_normalize_phase.value),
+            world.annex(mim_compile.ret_wrap_phase.value),
+            _repl_to_phase(
+                world,
+                _compile_repls(
+                    world,
+                    [
+                        _named_repl(world, "%mem.remem_repl"),
+                        _named_repl(world, "%mem.alloc2malloc_repl"),
+                        _named_repl(world, "%refly.remove_dbg_repl"),
+                        _named_repl(world, "%gpu.malloc2gpualloc_repl"),
+                    ],
+                ),
+            ),
+            _named_phase(world, "%ll.emit"),
+        ],
+    )
+
+
+def _define_compile_lam(world: mim.World, phase: mim.Def) -> mim.Def:
+    phase_t = world.annex(mim_compile.Phase.value)
+    compile_lam = world.mut_fun([], phase_t)
+    compile_lam.set("_compile")
+    compile_lam.app(True, compile_lam.var().proj(1), [phase])
+    compile_lam.externalize()
+    return compile_lam
 
 
 def model_to_mimir(
@@ -214,6 +443,7 @@ def model_to_mimir(
 
 
     if compile_phase == "default":
-        world.optimize()
+        compile_lam = _define_compile_lam(world, _default_compile_phase(world))
+        return _write_defs_to_string([("_compile", compile_lam), (name, result_lam)], max_depth)
 
     return _write_def_to_string(result_lam, name, max_depth)

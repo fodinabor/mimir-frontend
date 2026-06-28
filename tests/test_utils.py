@@ -77,6 +77,8 @@ def test_model_to_mimir_can_use_default_compile_phase():
 
     assert isinstance(ir, str)
     assert len(ir) > 0
+    assert "extern _compile" in ir
+    assert "fun extern mimir_module" in ir or "lam extern mimir_module" in ir
 
 
 def test_model_to_mimir_rejects_unknown_compile_phase():
