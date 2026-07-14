@@ -10,7 +10,7 @@ import torch
 from torch import fx
 
 from .translator import FXGraphTranslator
-from .utils import ShapeEnv, _shape_from_meta_value, tensor_type_from_shape
+from .utils import ShapeEnv, _shape_from_meta_value, shape_to_mimir_dims, tensor_type_from_shape
 
 
 DEFAULT_INDUCTOR_LOG_ROOT = Path("/Users/zc/courses/compiler/pytorch-play/logs/attn_debug/inductor")
@@ -27,6 +27,15 @@ def make_world() -> mim.World:
     driver = mim.Driver()
     driver.load_plugins(["math", "tensor", "affine"])
     return driver.world()
+
+
+def _element_type_from_dtype(world: mim.World, ops, dtype) -> mim.Def:
+    dtype_text = str(dtype)
+    if dtype_text.startswith("b") or dtype is torch.bool:
+        return world.type_bool()
+    if dtype_text.startswith("i") or dtype in (torch.int64, torch.int32, torch.long):
+        return world.type_idx(world.top_nat())
+    return ops.F32
 
 
 def load_inductor_graph_module(
@@ -75,8 +84,9 @@ def parse_annotation(annotation: str):
     return "tensor", dtype, dims
 
 
-def make_mimir_inputs_from_annotations(world: mim.World, graph_module: fx.GraphModule) -> list[mim.Def]:
-    ops = FXGraphTranslator(world).ops
+def make_mimir_inputs_from_annotations(world: mim.World, graph_module: fx.GraphModule, ops=None) -> list[mim.Def]:
+    if ops is None:
+        ops = FXGraphTranslator(world).ops
     inputs = []
     placeholders = [node for node in graph_module.graph.nodes if node.op == "placeholder"]
     parameters = list(inspect.signature(graph_module.forward).parameters.values())
@@ -90,15 +100,20 @@ def make_mimir_inputs_from_annotations(world: mim.World, graph_module: fx.GraphM
 
         if "val" in placeholder.meta:
             meta_value = placeholder.meta["val"]
-            elem_type = world.type_bool() if getattr(meta_value, "dtype", None) == torch.bool else ops.F32
+            elem_type = _element_type_from_dtype(world, ops, getattr(meta_value, "dtype", None))
             shape = shape_env.normalize_shape(_shape_from_meta_value(meta_value))
             tensor_type = tensor_type_from_shape(world, elem_type, shape, shape_env=shape_env, symbolic=True)
         else:
             _, dtype, dims = parsed
-            elem_type = world.type_bool() if dtype.startswith("b") else ops.F32
+            elem_type = _element_type_from_dtype(world, ops, dtype)
             shape = shape_env.normalize_shape(dims)
             tensor_type = tensor_type_from_shape(world, elem_type, shape, shape_env=shape_env, symbolic=True)
-        inputs.append(world.mut_con(tensor_type).var())
+        tensor = world.mut_con(tensor_type).var()
+        ops._remember_shape(
+            tensor,
+            shape_to_mimir_dims(world, shape, shape_env=shape_env, symbolic=True),
+        )
+        inputs.append(tensor)
 
     for node in graph_module.graph.nodes:
         if node.op != "get_attr":
@@ -113,7 +128,9 @@ def make_mimir_inputs_from_annotations(world: mim.World, graph_module: fx.GraphM
         else:
             elem_type = ops.F32
         tensor_type = tensor_type_from_shape(world, elem_type, attr.shape)
-        inputs.append(world.mut_con(tensor_type).var())
+        tensor = world.mut_con(tensor_type).var()
+        ops._remember_shape(tensor, shape_to_mimir_dims(world, attr.shape))
+        inputs.append(tensor)
 
     return inputs
 
@@ -124,7 +141,7 @@ def translate_inductor_readable(case_or_path: str | Path, root: Path = DEFAULT_I
     graph_module = load_inductor_graph_module(case_or_path, root=root)
     world = make_world()
     translator = FXGraphTranslator(world, module=graph_module)
-    inputs = make_mimir_inputs_from_annotations(world, graph_module)
+    inputs = make_mimir_inputs_from_annotations(world, graph_module, ops=translator.ops)
     
     if not as_function:
         return translator.translate(graph_module.graph, inputs)
@@ -161,7 +178,7 @@ def translate_inductor_readable_prefix(
     graph_module = load_inductor_graph_module(case_or_path, root=root)
     world = make_world()
     translator = FXGraphTranslator(world, module=graph_module)
-    inputs = make_mimir_inputs_from_annotations(world, graph_module)
+    inputs = make_mimir_inputs_from_annotations(world, graph_module, ops=translator.ops)
     graph = graph_module.graph
 
     translator.env = {}

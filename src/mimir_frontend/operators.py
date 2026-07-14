@@ -74,6 +74,10 @@ class OperatorLibrary:
         dims = self.shape_of(tensor_def)
         return self.world.lit_nat(len(dims)), self.world.tuple(dims)
 
+    def _rank_and_type_shape(self, tensor_def):
+        dims = self._shape_dims(tensor_def)
+        return self.world.lit_nat(len(dims)), self.world.tuple(dims)
+
     def shape_of(self, value):
         """
         Unified way to retrieve shape dims from a MimIR Def or PyTorch object.
@@ -83,6 +87,10 @@ class OperatorLibrary:
         3. MimIR Type system (Arr arity)
         4. PyTorch metadata (FakeTensor)
         """
+        cached = self._shape_cache.get(value)
+        if cached is not None:
+            return list(cached)
+
         if isinstance(value, mim.Def):
             # 1. Check symbolic map for inputs
             if hasattr(self, "input_to_syms") and value in self.input_to_syms:
@@ -115,14 +123,16 @@ class OperatorLibrary:
         raise TypeError(f"shape_of does not support {type(value)}")
 
     def _remember_shape(self, value, dims):
-        if isinstance(value, mim.Def):
-            normalized = []
-            for dim in dims:
-                if isinstance(dim, int):
-                    normalized.append(self.world.lit_nat(dim))
-                else:
-                    normalized.append(dim)
+        normalized = []
+        for dim in dims:
+            if isinstance(dim, int):
+                normalized.append(self.world.lit_nat(dim))
+            else:
+                normalized.append(dim)
+        try:
             self._shape_cache[value] = normalized
+        except TypeError:
+            pass
         return value
 
     def _shape_dims(self, tensor_def):
@@ -132,6 +142,9 @@ class OperatorLibrary:
             dims.append(tensor_type.arity())
             tensor_type = tensor_type.body()
         return dims
+
+    def _is_lit_nat_value(self, value, expected: int) -> bool:
+        return isinstance(value, mim.Lit) and value.get_nat() == expected
 
     def _apply_grouped(self, callee, args):
         return self.world.app(callee, self.world.tuple(args))
@@ -150,6 +163,13 @@ class OperatorLibrary:
         args = lam.var(0)
         reduced = self.world.app(op, [args.proj(2, 0), args.proj(2, 1)])
         lam.app(True, lam.ret_var(), [reduced])
+        return lam
+
+    def _scalar_binary_lambda(self, op, arg_type, ret_type):
+        args_type = self.world.arr(self.world.lit_nat(2), arg_type)
+        lam = self.world.mut_lam(args_type, ret_type)
+        args = lam.var()
+        lam.set_body(True, self.world.app(op, [args.proj(2, 0), args.proj(2, 1)]))
         return lam
 
     def _tensor_element_type(self, tensor_def):
@@ -191,12 +211,12 @@ class OperatorLibrary:
             if not self.rules.same_shape(s_rhs_dims, output_dims):
                 rhs = self.expand(rhs, output_dims)
 
-        rank, shape = self._rank_and_shape(lhs)
+        rank, shape = self._rank_and_type_shape(lhs)
         callee = self.world.annex(tensor.binary.value)
         callee = self._apply_grouped(callee, [in_type, in_type, out_type])
-        callee = self.world.app(callee, op)
+        callee = self.world.app(callee, self._scalar_binary_lambda(op, in_type, out_type))
         callee = self._apply_grouped(callee, [rank, shape])
-        res = self.world.app(callee, [lhs, rhs])
+        res = self.world.app(callee, self.world.tuple([lhs, rhs]))
         
         output_dims = self.rules.broadcast_shape(s_lhs_dims, s_rhs_dims)
         return self._remember_shape(res, output_dims)
@@ -212,7 +232,7 @@ class OperatorLibrary:
         in_type = self._tensor_element_type(input)
         if out_type is None:
             out_type = in_type
-        rank, shape = self._rank_and_shape(input)
+        rank, shape = self._rank_and_type_shape(input)
         res = self._unary_with_types(in_type, out_type, op, input, rank, shape)
         return self._remember_shape(res, self.shape_of(input))
 
@@ -424,10 +444,11 @@ class OperatorLibrary:
             return input
 
         elem_type = self._tensor_element_type(input)
+        _, in_shape_tuple = self._rank_and_shape(input)
 
         if in_rank_val == 0:
             callee = self.world.annex(tensor.map.value)
-            callee = self.world.app(callee, self.world.tuple([elem_type, self.world.lit_nat(0), self.world.tuple([])]))
+            callee = self._apply_grouped(callee, [elem_type, self.world.lit_nat(0), self.world.tuple([])])
             lam = self.world.mut_lam(self.world.sigma([]), elem_type)
             lam.set_body(True, input)
             callee = self.world.app(callee, lam)
@@ -435,22 +456,20 @@ class OperatorLibrary:
             result = self.world.app(callee, self.world.tuple([]))
             return self._remember_shape(result, shape)
 
-        _, in_shape_tuple = self._rank_and_shape(input)
         if in_rank_val == out_rank_val:
             callee = self.world.annex(tensor.broadcast.value)
             callee = self._apply_grouped(callee, [elem_type, out_rank])
-            result = self.world.app(callee, [in_shape_tuple, out_shape_tuple, input])
+            result = self.world.app(callee, self.world.tuple([in_shape_tuple, out_shape_tuple, input]))
+            return self._remember_shape(result, shape)
         else:
             callee = self.world.annex(tensor.broadcast_in_dim.value)
             callee = self._apply_grouped(callee, [elem_type, self.world.lit_nat(in_rank_val), out_rank])
-            
             idx_t = self.world.type_idx(out_rank)
             offset = out_rank_val - in_rank_val
             index_mapping = [self.world.lit(idx_t, offset + i) for i in range(in_rank_val)]
             index_tuple = self.world.tuple(index_mapping)
-            
-            result = self.world.app(callee, [in_shape_tuple, out_shape_tuple, input, index_tuple])
-        return self._remember_shape(result, shape)
+            result = self.world.app(callee, self.world.tuple([in_shape_tuple, out_shape_tuple, input, index_tuple]))
+            return self._remember_shape(result, shape)
 
     def full(self, shape, fill_value, dtype=None):
         """
@@ -665,14 +684,295 @@ class OperatorLibrary:
         callee = self.world.app(callee, ring)
         return self.world.implicit_app(callee, [lhs, rhs])
 
+    def linear(self, input, weight, bias=None):
+        input_dims = self.shape_of(input)
+        weight_dims = self.shape_of(weight)
+        if len(input_dims) != 2 or len(weight_dims) != 2:
+            raise NotImplementedError("linear currently supports 2D input and 2D weight only")
+
+        in_features = input_dims[1]
+        out_features = weight_dims[0]
+        if weight_dims[1] != in_features:
+            raise NotImplementedError("linear weight in_features must match input features")
+
+        transposed_weight = self.transpose(weight, [1, 0])
+        if bias is None:
+            result = self.mm(input, transposed_weight)
+        else:
+            batch = input_dims[0]
+            bias_row = self.reshape(bias, [1, out_features])
+            bias_expanded = self.repeat(bias_row, [batch, out_features])
+            result = self.add(self.mm(input, transposed_weight), bias_expanded)
+        return self._remember_shape(result, [input_dims[0], out_features])
+
     def convolution(self, x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
-        raise NotImplementedError("aten.convolution is not implemented")
+        if groups != 1:
+            raise NotImplementedError("aten.convolution with groups != 1 is not implemented")
+
+        semantic_in_dims = self.shape_of(x)
+        weight_dims = self.shape_of(weight)
+        if len(semantic_in_dims) != 4 or len(weight_dims) != 4:
+            raise NotImplementedError("aten.convolution currently supports 4D NCHW inputs only")
+
+        type_in_dims = self._shape_dims(x)
+        if len(type_in_dims) == 3 and self._is_lit_nat_value(semantic_in_dims[0], 1):
+            in_dims = [semantic_in_dims[0], type_in_dims[0], type_in_dims[1], type_in_dims[2]]
+        else:
+            in_dims = semantic_in_dims
+
+        stride = self._pair(stride, "stride")
+        padding = self._pair(padding, "padding")
+        dilation = self._pair(dilation, "dilation")
+
+        n, _cin, h, w = in_dims
+        cout, _wcin, kh, kw = weight_dims
+        out_spatial = self._conv2d_spatial_shape((h, w), (kh, kw), stride, dilation, padding)
+        out_dims = [n, cout, out_spatial[0], out_spatial[1]]
+
+        ring = self.world.tuple([self.F32, self._f32_float_lit(0.0), self.f32_add_axm, self.f32_mul_axm])
+        callee = self.world.annex(tensor.conv.value)
+        callee = self.world.app(callee, ring)
+        callee = self._apply_grouped(callee, [n, in_dims[1], cout, h, w, kh, kw])
+        callee = self._apply_grouped(
+            callee,
+            [
+                self.world.tuple([self._to_nat(stride[0]), self._to_nat(stride[1])]),
+                self.world.tuple([self._to_nat(dilation[0]), self._to_nat(dilation[1])]),
+                self.world.tuple([self._to_nat(padding[0]), self._to_nat(padding[1])]),
+            ],
+        )
+        result = self.world.app(callee, [x, weight])
+        result = self._remember_shape(result, out_dims)
+
+        if bias is not None:
+            add_dims = self._shape_dims(result)
+            bias_shape = []
+            for dim in add_dims:
+                if dim == cout:
+                    bias_shape.append(cout)
+                else:
+                    bias_shape.append(1)
+            if not bias_shape:
+                bias_shape = [cout]
+            bias = self.reshape(bias, bias_shape)
+            self._remember_shape(result, add_dims)
+            result = self.add(result, bias)
+            self._remember_shape(result, out_dims)
+        return result
+
+    def _to_nat(self, value):
+        return self.world.lit_nat(value) if isinstance(value, int) else value
+
+    def _pair(self, value, name):
+        if isinstance(value, int):
+            return (value, value)
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            return tuple(value)
+        raise NotImplementedError(f"{name} must be an int or length-2 sequence")
+
+    def _nat_binop(self, op, lhs, rhs):
+        return self.world.call(op, [self._to_nat(lhs), self._to_nat(rhs)])
+
+    def _nat_product(self, dims):
+        result = self.world.lit_nat(1)
+        for dim in dims:
+            result = self._nat_binop(core.nat.mul, result, dim)
+        return result
+
+    def nat_floordiv(self, lhs, rhs):
+        return self._nat_binop(core.nat.div, lhs, rhs)
+
+    def _conv2d_dim(self, size, kernel, stride, dilation, padding):
+        two_pad = self._nat_binop(core.nat.mul, 2, padding)
+        padded = self._nat_binop(core.nat.add, size, two_pad)
+        kernel_minus_one = self._nat_binop(core.nat.sub, kernel, 1)
+        effective_kernel_minus_one = self._nat_binop(core.nat.mul, dilation, kernel_minus_one)
+        numerator = self._nat_binop(
+            core.nat.sub,
+            self._nat_binop(core.nat.sub, padded, effective_kernel_minus_one),
+            1,
+        )
+        return self._nat_binop(core.nat.add, self._nat_binop(core.nat.div, numerator, stride), 1)
+
+    def _conv2d_spatial_shape(self, spatial, kernel, stride, dilation, padding):
+        return [
+            self._conv2d_dim(spatial[0], kernel[0], stride[0], dilation[0], padding[0]),
+            self._conv2d_dim(spatial[1], kernel[1], stride[1], dilation[1], padding[1]),
+        ]
+
+    def pool2d(self, x, kernel_size, stride=None, padding=0, dilation=1, mode="max"):
+        semantic_in_dims = self.shape_of(x)
+        if len(semantic_in_dims) != 4:
+            raise NotImplementedError("pool2d currently supports 4D NCHW inputs only")
+
+        type_in_dims = self._shape_dims(x)
+        if len(type_in_dims) == 3 and self._is_lit_nat_value(semantic_in_dims[0], 1):
+            in_dims = [semantic_in_dims[0], type_in_dims[0], type_in_dims[1], type_in_dims[2]]
+        else:
+            in_dims = semantic_in_dims
+
+        kernel = self._pair(kernel_size, "kernel_size")
+        if stride is None:
+            stride = kernel
+        stride = self._pair(stride, "stride")
+        padding = self._pair(padding, "padding")
+        dilation = self._pair(dilation, "dilation")
+
+        n, c, h, w = in_dims
+        out_spatial = self._conv2d_spatial_shape((h, w), kernel, stride, dilation, padding)
+        out_dims = [n, c, out_spatial[0], out_spatial[1]]
+
+        if mode == "max":
+            reduce_fn = self._scalar_binary_lambda(self.f32_max_axm, self.F32, self.F32)
+            init = self._f32_float_lit(-float("inf"))
+        elif mode == "avg":
+            reduce_fn = self._scalar_binary_lambda(self.f32_add_axm, self.F32, self.F32)
+            init = self._f32_float_lit(0.0)
+        else:
+            raise NotImplementedError(f"pool2d mode {mode} is not implemented")
+
+        callee = self.world.annex(tensor.pool.value)
+        callee = self.world.app(callee, self.F32)
+        callee = self._apply_grouped(callee, [reduce_fn, init])
+        callee = self._apply_grouped(callee, [n, c, h, w])
+        callee = self._apply_grouped(
+            callee,
+            [
+                self.world.tuple([self._to_nat(kernel[0]), self._to_nat(kernel[1])]),
+                self.world.tuple([self._to_nat(stride[0]), self._to_nat(stride[1])]),
+                self.world.tuple([self._to_nat(dilation[0]), self._to_nat(dilation[1])]),
+                self.world.tuple([self._to_nat(padding[0]), self._to_nat(padding[1])]),
+                self.world.tuple(out_spatial),
+            ],
+        )
+        result = self.world.app(callee, [x])
+        result = self._remember_shape(result, out_dims)
+
+        if mode == "avg":
+            scale = 1.0 / float(kernel[0] * kernel[1])
+            result = self.mul(result, scale)
+            self._remember_shape(result, out_dims)
+        return result
+
+    def max_pool2d(self, x, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False, return_indices=False):
+        if ceil_mode:
+            raise NotImplementedError("max_pool2d ceil_mode=True is not implemented")
+        if return_indices:
+            raise NotImplementedError("max_pool2d return_indices=True is not implemented")
+        return self.pool2d(x, kernel_size, stride=stride, padding=padding, dilation=dilation, mode="max")
+
+    def avg_pool2d(
+        self,
+        x,
+        kernel_size,
+        stride=None,
+        padding=0,
+        ceil_mode=False,
+        count_include_pad=True,
+        divisor_override=None,
+    ):
+        if ceil_mode:
+            raise NotImplementedError("avg_pool2d ceil_mode=True is not implemented")
+        if not count_include_pad:
+            raise NotImplementedError("avg_pool2d count_include_pad=False is not implemented")
+        if divisor_override is not None:
+            raise NotImplementedError("avg_pool2d divisor_override is not implemented")
+        return self.pool2d(x, kernel_size, stride=stride, padding=padding, dilation=1, mode="avg")
+
+    def repeat(self, x, shape):
+        in_dims = self.shape_of(x)
+        out_dims = list(shape)
+        if len(in_dims) != len(out_dims):
+            raise NotImplementedError("repeat currently requires input and output ranks to match")
+
+        in_rank, in_shape_tuple = self._rank_and_shape(x)
+        out_shape_tuple, _ = self._extract_shape(out_dims)
+        callee = self.world.annex(tensor.repeat.value)
+        elem_t = self._tensor_element_type(x)
+        callee = self._apply_grouped(callee, [elem_t, in_rank])
+        callee = self.world.app(callee, in_shape_tuple)
+        callee = self.world.app(callee, out_shape_tuple)
+        result = self.world.app(callee, x)
+        return self._remember_shape(result, out_dims)
+
+    def gather(self, input, index, dim=0):
+        input_dims = self.shape_of(input)
+        index_dims = self.shape_of(index)
+        rank_val = len(input_dims)
+        if dim < 0:
+            dim += rank_val
+        if rank_val != len(index_dims):
+            raise NotImplementedError("aten.gather requires index rank to match input rank")
+
+        elem_t = self._tensor_element_type(input)
+        rank = self.world.lit_nat(rank_val)
+        dim_idx = self.world.lit(self.world.type_idx(rank), dim)
+
+        callee = self.world.annex(tensor.gather.value)
+        callee = self._apply_grouped(callee, [elem_t, rank])
+        callee = self._apply_grouped(callee, [self.world.tuple(input_dims), self.world.tuple(index_dims)])
+        callee = self.world.app(callee, dim_idx)
+        result = self.world.app(callee, [input, index])
+        return self._remember_shape(result, index_dims)
+
+    def index_tensor(self, input, index):
+        input_dims = self.shape_of(input)
+        index_dims = self.shape_of(index)
+        if not index_dims:
+            return self.select(input, 0, index)
+        if len(input_dims) < 1:
+            raise NotImplementedError("aten.index.Tensor requires tensor input")
+
+        # PyTorch `x[idx]` indexes dim 0 and preserves trailing input dimensions.
+        output_dims = index_dims + input_dims[1:]
+        gather_index = index
+        for _ in input_dims[1:]:
+            gather_index = self.unsqueeze(gather_index, -1)
+        if len(output_dims) != len(self.shape_of(gather_index)):
+            raise NotImplementedError("aten.index.Tensor rank normalization failed")
+        gather_index = self.expand(gather_index, output_dims)
+        return self.gather(input, gather_index, dim=0)
+
+    def scatter(self, input, dim, index, src):
+        input_dims = self.shape_of(input)
+        index_dims = self.shape_of(index)
+        rank_val = len(input_dims)
+        if dim < 0:
+            dim += rank_val
+        if rank_val != len(index_dims):
+            raise NotImplementedError("aten.scatter requires index rank to match input rank")
+
+        elem_t = self._tensor_element_type(input)
+        rank = self.world.lit_nat(rank_val)
+        dim_idx = self.world.lit(self.world.type_idx(rank), dim)
+
+        callee = self.world.annex(tensor.scatter.value)
+        callee = self._apply_grouped(callee, [elem_t, rank])
+        callee = self._apply_grouped(callee, [self.world.tuple(input_dims), self.world.tuple(index_dims)])
+        callee = self.world.app(callee, dim_idx)
+        result = self.world.app(callee, [input, index, src])
+        return self._remember_shape(result, input_dims)
 
     # Injective
+    def _normalize_reshape_shape(self, x, shape):
+        in_dims = self.shape_of(x)
+        out_dims = list(shape)
+        infer_positions = [i for i, dim in enumerate(out_dims) if isinstance(dim, int) and dim == -1]
+        if not infer_positions:
+            return out_dims
+        if len(infer_positions) > 1:
+            raise ValueError("reshape can only infer one dimension")
+
+        known_dims = [dim for dim in out_dims if not (isinstance(dim, int) and dim == -1)]
+        inferred = self._nat_binop(core.nat.div, self._nat_product(in_dims), self._nat_product(known_dims))
+        out_dims[infer_positions[0]] = inferred
+        return out_dims
+
     def reshape(self, x, shape):
         """
         Translates to `%tensor.reshape`.
         """
+        shape = self._normalize_reshape_shape(x, shape)
         in_rank, in_shape_tuple = self._rank_and_shape(x)
         out_shape_tuple, out_rank_val = self._extract_shape(shape)
         out_rank = self.world.lit_nat(out_rank_val)
@@ -687,6 +987,19 @@ class OperatorLibrary:
 
     def view(self, x, shape):
         return self.reshape(x, shape)
+
+    def flatten(self, x, start_dim=0, end_dim=-1):
+        in_dims = self.shape_of(x)
+        rank = len(in_dims)
+        if start_dim < 0:
+            start_dim += rank
+        if end_dim < 0:
+            end_dim += rank
+        if start_dim < 0 or end_dim >= rank or start_dim > end_dim:
+            raise ValueError(f"invalid flatten dims start_dim={start_dim}, end_dim={end_dim}, rank={rank}")
+
+        out_dims = in_dims[:start_dim] + [self._nat_product(in_dims[start_dim : end_dim + 1])] + in_dims[end_dim + 1 :]
+        return self.reshape(x, out_dims)
 
     def slice(self, x, dim, start, end, step=1):
         """

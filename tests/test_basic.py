@@ -168,6 +168,18 @@ def test_single_elementwise_operator(shape_kind, rank):
     assert isinstance(result, mim.Def)
 
 
+def test_functional_relu_translates():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return torch.nn.functional.relu(x)
+
+    world = make_world()
+    result = translate_model(Model(), make_static_inputs_with_shapes(world, [(2, 3, 4)]))
+
+    assert isinstance(result, mim.Def)
+    assert "%tensor.unary" in def_to_string(result)
+
+
 def test_shape_of_reads_symbolic_dims_from_mim_def_type():
     world = make_world()
     translator = FXGraphTranslator(world)
@@ -216,6 +228,27 @@ def test_same_shape_dims_accepts_shared_symbolic_shape():
     m = world.mut_con(world.type_nat()).var()
 
     assert ops.rules.broadcast_shape([n, m], [n, m]) == [n, m]
+
+
+@pytest.mark.parametrize("shape_kind", ["static", "dynamic"])
+def test_builtin_linear_translates(shape_kind):
+    class Model(torch.nn.Module):
+        def forward(self, x, weight, bias):
+            return torch._C._nn.linear(x, weight, bias)
+
+    world = make_world()
+    if shape_kind == "static":
+        x = make_static_inputs_with_shapes(world, [(2, 16)])[0]
+    else:
+        batch = world.mut_con(world.type_nat()).var()
+        x = make_symbolic_tensor_input(world, [batch, world.lit_nat(16)])
+    weight = make_static_inputs_with_shapes(world, [(32, 16)])[0]
+    bias = make_static_inputs_with_shapes(world, [(32,)])[0]
+
+    result = translate_model(Model(), [x, weight, bias])
+
+    assert isinstance(result, mim.Def)
+    assert tensor_shape_values(result)[1] == 32
 
 
 def test_broadcast_dim_keeps_lhs_for_distinct_symbolic_dims():
@@ -424,6 +457,188 @@ def test_addmm_decomposes_to_mm_and_add():
 
     assert tensor_shape_values(result) == [2, 4]
     assert_ir_contains_in_order(def_to_string(result), ["%tensor.product_2d", "%tensor.binary"])
+
+
+def test_convolution_2d_with_bias_translates_to_conv_and_add():
+    class Model(torch.nn.Module):
+        def forward(self, x, weight, bias):
+            return torch.ops.aten.convolution.default(
+                x,
+                weight,
+                bias,
+                [1, 1],
+                [1, 1],
+                [1, 1],
+                False,
+                [0, 0],
+                1,
+            )
+
+    world = make_world()
+    x, weight, bias = make_static_inputs_with_shapes(world, [(2, 3, 8, 8), (4, 3, 3, 3), (4,)])
+    result = translate_model(Model(), [x, weight, bias])
+
+    assert tensor_shape_values(result) == [2, 4, 8, 8]
+    assert_ir_contains_in_order(def_to_string(result), ["%tensor.conv", "%tensor.binary"])
+
+
+def test_functional_conv2d_translates_to_convolution():
+    class Model(torch.nn.Module):
+        def forward(self, x, weight, bias):
+            return torch.nn.functional.conv2d(x, weight, bias, stride=1, padding=1)
+
+    world = make_world()
+    x, weight, bias = make_static_inputs_with_shapes(world, [(2, 3, 8, 8), (4, 3, 3, 3), (4,)])
+    result = translate_model(Model(), [x, weight, bias])
+
+    assert tensor_shape_values(result) == [2, 4, 8, 8]
+    assert_ir_contains_in_order(def_to_string(result), ["%tensor.conv", "%tensor.binary"])
+
+
+def test_adaptive_avg_pool2d_output_one_translates_to_mean_keepdim():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return torch.nn.functional.adaptive_avg_pool2d(x, (1, 1))
+
+    world = make_world()
+    x, = make_static_inputs_with_shapes(world, [(2, 3, 8, 8)])
+    result = translate_model(Model(), [x])
+    ir = def_to_string(result)
+
+    assert "(2, 3, 1, 1)" in ir
+    assert "%tensor.map_reduce" in ir
+
+
+def test_convolution_batch_one_result_can_feed_next_convolution():
+    class Model(torch.nn.Module):
+        def forward(self, x, weight0, bias0, weight1, bias1):
+            y = torch.ops.aten.convolution.default(
+                x,
+                weight0,
+                bias0,
+                [1, 1],
+                [1, 1],
+                [1, 1],
+                False,
+                [0, 0],
+                1,
+            )
+            y = torch.ops.aten.relu.default(y)
+            return torch.ops.aten.convolution.default(
+                y,
+                weight1,
+                bias1,
+                [1, 1],
+                [1, 1],
+                [1, 1],
+                False,
+                [0, 0],
+                1,
+            )
+
+    world = make_world()
+    inputs = make_static_inputs_with_shapes(
+        world,
+        [(1, 3, 8, 8), (4, 3, 3, 3), (4,), (5, 4, 3, 3), (5,)],
+    )
+    traced = fx.symbolic_trace(Model())
+    translator = FXGraphTranslator(world, module=traced)
+    for inp, shape in zip(inputs, [(1, 3, 8, 8), (4, 3, 3, 3), (4,), (5, 4, 3, 3), (5,)]):
+        translator.ops._remember_shape(inp, shape)
+    result = translator.translate(traced.graph, inputs)
+
+    assert tensor_shape_values(result) == [5, 8, 8]
+    assert_ir_contains_in_order(def_to_string(result), ["%tensor.conv", "%tensor.unary", "%tensor.conv"])
+
+
+def test_index_tensor_translates_to_gather_dim0():
+    class Model(torch.nn.Module):
+        def forward(self, x, index):
+            return torch.ops.aten.index.Tensor(x, [index])
+
+    world = make_world()
+    idx_elem = world.type_idx(world.lit_nat(4))
+    x, index = make_static_inputs_with_shapes(world, [(4, 3), (2,)], elem_type=FXGraphTranslator(world).ops.F32)
+    index = world.mut_con(world.arr(world.lit_nat(2), idx_elem)).var()
+
+    result = translate_model(Model(), [x, index])
+
+    assert tensor_shape_values(result) == [2, 3]
+    assert "%tensor.gather" in def_to_string(result)
+
+
+def test_scatter_src_translates_to_tensor_scatter():
+    class Model(torch.nn.Module):
+        def forward(self, x, index, src):
+            return torch.ops.aten.scatter.src(x, 0, index, src)
+
+    world = make_world()
+    ops = FXGraphTranslator(world).ops
+    x = make_static_inputs_with_shapes(world, [(4, 3)], elem_type=ops.F32)[0]
+    index = make_static_inputs_with_shapes(world, [(2, 3)], elem_type=world.type_idx(world.lit_nat(4)))[0]
+    src = make_static_inputs_with_shapes(world, [(2, 3)], elem_type=ops.F32)[0]
+
+    result = translate_model(Model(), [x, index, src])
+
+    assert tensor_shape_values(result) == [4, 3]
+    assert "%tensor.scatter" in def_to_string(result)
+
+
+def test_max_pool2d_translates_to_tensor_pool():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return torch.ops.aten.max_pool2d.default(x, [2, 2], [2, 2], [0, 0], [1, 1])
+
+    world = make_world()
+    x = make_static_inputs_with_shapes(world, [(2, 3, 8, 8)])[0]
+    result = translate_model(Model(), [x])
+
+    assert tensor_shape_values(result) == [2, 3, 4, 4]
+    assert "%tensor.pool" in def_to_string(result)
+
+
+def test_avg_pool2d_translates_to_tensor_pool_and_scale():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return torch.ops.aten.avg_pool2d.default(x, [2, 2], [2, 2], [0, 0], False, True, None)
+
+    world = make_world()
+    x = make_static_inputs_with_shapes(world, [(2, 3, 8, 8)])[0]
+    result = translate_model(Model(), [x])
+
+    assert tensor_shape_values(result) == [2, 3, 4, 4]
+    assert_ir_contains_in_order(def_to_string(result), ["%tensor.pool", "%tensor.unary"])
+
+
+def test_lenet_style_cnn_with_pooling_translates():
+    class Model(torch.nn.Module):
+        def forward(self, x, w0, b0, w1, b1, fc_w, fc_b):
+            x = torch.ops.aten.convolution.default(x, w0, b0, [1, 1], [2, 2], [1, 1], False, [0, 0], 1)
+            x = torch.ops.aten.relu.default(x)
+            x = torch.ops.aten.max_pool2d.default(x, [2, 2], [2, 2], [0, 0], [1, 1])
+            x = torch.ops.aten.convolution.default(x, w1, b1, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+            x = torch.ops.aten.relu.default(x)
+            x = torch.ops.aten.avg_pool2d.default(x, [2, 2], [2, 2], [0, 0], False, True, None)
+            x = torch.ops.aten.view.default(x, [2, 6 * 5 * 5])
+            return torch.ops.aten.addmm.default(fc_b, x, fc_w)
+
+    world = make_world()
+    inputs = make_static_inputs_with_shapes(
+        world,
+        [(2, 1, 28, 28), (4, 1, 5, 5), (4,), (6, 4, 5, 5), (6,), (6 * 5 * 5, 10), (10,)],
+    )
+    shapes = [(2, 1, 28, 28), (4, 1, 5, 5), (4,), (6, 4, 5, 5), (6,), (6 * 5 * 5, 10), (10,)]
+    traced = fx.symbolic_trace(Model())
+    translator = FXGraphTranslator(world, module=traced)
+    for inp, shape in zip(inputs, shapes):
+        translator.ops._remember_shape(inp, shape)
+    result = translator.translate(traced.graph, inputs)
+
+    assert tensor_shape_values(result) == [2, 10]
+    assert_ir_contains_in_order(
+        def_to_string(result),
+        ["%tensor.conv", "%tensor.unary", "%tensor.pool", "%tensor.conv", "%tensor.pool", "%tensor.reshape", "%tensor.product_2d"],
+    )
 
 
 @pytest.mark.parametrize(
@@ -711,6 +926,45 @@ def test_reshape_operator():
     assert isinstance(result, mim.Def)
     ir = def_to_string(result)
     assert_ir_contains_in_order(ir, ["%tensor.reshape"])
+
+
+def test_view_infers_negative_one_dimension():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return x.view(-1, 16 * 5 * 5)
+
+    world = make_world()
+    x, = make_static_inputs_with_shapes(world, [(8, 16, 5, 5)])
+    result = translate_model(Model(), [x])
+
+    assert tensor_shape_values(result) == [8, 400]
+    assert "%tensor.reshape" in def_to_string(result)
+
+
+def test_torch_flatten_translates_to_reshape():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return torch.flatten(x, 1)
+
+    world = make_world()
+    x, = make_static_inputs_with_shapes(world, [(2, 3, 4, 5)])
+    result = translate_model(Model(), [x])
+
+    assert tensor_shape_values(result) == [2, 60]
+    assert "%tensor.reshape" in def_to_string(result)
+
+
+def test_dropout_zero_probability_is_identity():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return torch.nn.functional.dropout(x, p=0.0, training=True)
+
+    world = make_world()
+    x, = make_static_inputs_with_shapes(world, [(2, 3, 4)])
+    result = translate_model(Model(), [x])
+
+    assert result is x
+
 
 def test_slice_operator():
     class Model(torch.nn.Module):

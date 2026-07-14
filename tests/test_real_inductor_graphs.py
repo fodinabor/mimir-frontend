@@ -8,8 +8,8 @@ from mimir_frontend.inductor_readable import translate_inductor_readable
 @pytest.mark.parametrize(
     "case_name,expected_frontier",
     [
-        ("faster_rcnn_1", "aten.convolution"),
-        ("gcn_1", "aten.index.Tensor"),
+        ("faster_rcnn_1", "full with dtype torch.int64"),
+        ("gcn_1", "aten.scatter_add"),
         ("moe_1", "torch.max with dim"),
     ],
 )

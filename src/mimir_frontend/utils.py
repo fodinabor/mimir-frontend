@@ -117,6 +117,11 @@ def _make_driver(compile_phase: str) -> mim.Driver:
     return driver
 
 
+class InlineModuleTracer(fx.Tracer):
+    def is_leaf_module(self, m: torch.nn.Module, qualname: str) -> bool:
+        return False
+
+
 @contextmanager
 def _temporary_cwd():
     old_cwd = os.getcwd()
@@ -269,7 +274,8 @@ def model_to_mimir(
     if isinstance(model, fx.GraphModule):
         traced = model
     else:
-        traced = fx.symbolic_trace(model)
+        tracer = InlineModuleTracer()
+        traced = fx.GraphModule(model, tracer.trace(model))
     graph = traced.graph
 
     if input_shapes is None:
@@ -289,6 +295,10 @@ def model_to_mimir(
         [dim if isinstance(dim, str) else None for dim in shape]
         for shape in normalized_input_shapes
     ]
+    translator.input_shapes = [
+        shape_to_mimir_dims(world, shape, shape_env=shape_env, symbolic=True)
+        for shape in normalized_input_shapes
+    ]
 
     # 2. Construct Domain Type: [sym_dims..., tensor_inputs..., params...]
     # In MimIR, the function domain is represented as a Sigma (tuple) type.
@@ -306,11 +316,13 @@ def model_to_mimir(
     # Parameters
     # FX weights/biases (extracted from get_attr) are passed as trailing arguments
     param_types = []
+    translator.param_shapes = []
     for target in param_names:
         attr = traced
         for part in target.split("."):
             attr = getattr(attr, part)
         param_types.append(tensor_type_from_shape(world, ops.F32, attr.shape))
+        translator.param_shapes.append(shape_to_mimir_dims(world, attr.shape))
 
     full_dom_types = dom_types + tensor_input_types + param_types
     

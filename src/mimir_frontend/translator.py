@@ -49,10 +49,12 @@ class FXGraphTranslator:
         m[torch.clamp] = self._wrap_clamp()
         m["aten.clamp.default"] = self._wrap_clamp()
         m["aten.clamp.Tensor"] = self._wrap_clamp()
+        m[operator.floordiv] = self._wrap_nat_binary(self.ops.nat_floordiv)
 
         # Elementwise Unary
         unary_ops = [
             (torch.relu, "aten.relu.default", self.ops.relu),
+            (torch.nn.functional.relu, "relu", self.ops.relu),
             (torch.exp, "aten.exp.default", self.ops.exp),
             (torch.tanh, "aten.tanh.default", self.ops.tanh),
             (torch.sqrt, "aten.sqrt.default", self.ops.sqrt),
@@ -88,10 +90,14 @@ class FXGraphTranslator:
         m["reshape"] = self._wrap_reshape()
         m["view"] = self._wrap_reshape()
         m["aten.view.default"] = self._wrap_reshape()
+        m[torch.flatten] = self._wrap_flatten()
+        m["aten.flatten.using_ints"] = self._wrap_flatten()
+        m["flatten"] = self._wrap_flatten()
 
         m["aten.slice.Tensor"] = self._wrap_slice()
         m["aten.select.int"] = self._wrap_select()
         m["aten.split.Tensor"] = self._wrap_split()
+        m["split"] = self._wrap_split()
         
         m[torch.squeeze] = self._wrap_squeeze()
         m["squeeze"] = self._wrap_squeeze()
@@ -101,12 +107,17 @@ class FXGraphTranslator:
         m[torch.unsqueeze] = self._wrap_unsqueeze()
         m["unsqueeze"] = self._wrap_unsqueeze()
         m["aten.unsqueeze.default"] = self._wrap_unsqueeze()
+        m["contiguous"] = self._wrap_contiguous()
+        m["size"] = self._wrap_size()
 
         m[torch.clone] = self._wrap_unary(self.ops.clone)
         m["clone"] = self._wrap_unary(self.ops.clone)
         m["aten.clone.default"] = self._wrap_unary(self.ops.clone)
         m["aten.copy.default"] = self._wrap_binary(self.ops.copy)
         m["aten.lift_fresh_copy.default"] = self._wrap_unary(self.ops.clone)
+        m[torch.nn.functional.dropout] = self._wrap_dropout()
+        m["aten.dropout.default"] = self._wrap_dropout()
+        m["dropout"] = self._wrap_dropout()
         
         # Broadcast
         m[torch.expand_copy] = self._wrap_expand()
@@ -135,10 +146,35 @@ class FXGraphTranslator:
         m[torch.mm] = self._wrap_binary(self.ops.mm)
         m["aten.mm.default"] = self._wrap_binary(self.ops.mm)
         m["aten.addmm.default"] = self._wrap_addmm()
+        if hasattr(torch, "_C") and hasattr(torch._C, "_nn") and hasattr(torch._C._nn, "linear"):
+            m[torch._C._nn.linear] = self._wrap_linear()
+        m["aten.linear.default"] = self._wrap_linear()
+        m["torch._C._nn.linear"] = self._wrap_linear()
 
         # Convolution
-        m[torch.convolution] = self._wrap_unsupported("aten.convolution")
-        m["aten.convolution.default"] = self._wrap_unsupported("aten.convolution")
+        m[torch.convolution] = self._wrap_convolution()
+        if hasattr(torch, "conv2d"):
+            m[torch.conv2d] = self._wrap_conv2d()
+        m[torch.nn.functional.conv2d] = self._wrap_conv2d()
+        m["aten.convolution.default"] = self._wrap_convolution()
+        m["aten.conv2d.default"] = self._wrap_conv2d()
+        m["conv2d"] = self._wrap_conv2d()
+
+        # Pooling
+        m[torch.nn.functional.max_pool2d] = self._wrap_max_pool2d()
+        m["aten.max_pool2d.default"] = self._wrap_max_pool2d()
+        m["aten.max_pool2d_with_indices.default"] = self._wrap_max_pool2d(return_indices=True)
+        m[torch.nn.functional.avg_pool2d] = self._wrap_avg_pool2d()
+        m["aten.avg_pool2d.default"] = self._wrap_avg_pool2d()
+        m[torch.nn.functional.adaptive_avg_pool2d] = self._wrap_adaptive_avg_pool2d()
+        m["aten.adaptive_avg_pool2d.default"] = self._wrap_adaptive_avg_pool2d()
+        m["adaptive_avg_pool2d"] = self._wrap_adaptive_avg_pool2d()
+
+        # Indexing / Scatter
+        m["aten.index.Tensor"] = self._wrap_index_tensor()
+        m["aten.scatter.src"] = self._wrap_scatter()
+        m["aten.scatter.default"] = self._wrap_scatter()
+        m["aten.scatter_add.default"] = self._wrap_unsupported("aten.scatter_add")
 
         # Selection
         m[torch.where] = self._wrap_where()
@@ -156,11 +192,152 @@ class FXGraphTranslator:
             return op_func(args[0], args[1])
         return convert
 
+    def _wrap_nat_binary(self, op_func):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            return op_func(args[0], args[1])
+        return convert
+
     def _wrap_addmm(self):
         def convert(node: fx.Node):
             args = self.retrieve_args(node)
             bias, input, mat2 = args[:3]
-            return self.ops.add(self.ops.mm(input, mat2), bias)
+            out_features = self.ops.shape_of(mat2)[1]
+            batch = self.ops.shape_of(input)[0]
+            bias_row = self.ops.reshape(bias, [1, out_features])
+            bias_expanded = self.ops.repeat(bias_row, [batch, out_features])
+            return self.ops.add(self.ops.mm(input, mat2), bias_expanded)
+        return convert
+
+    def _wrap_linear(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            input = args[0]
+            weight = args[1]
+            bias = args[2] if len(args) > 2 else node.kwargs.get("bias", None)
+            return self.ops.linear(input, weight, bias=bias)
+        return convert
+
+    def _wrap_convolution(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            weight = args[1]
+            bias = args[2] if len(args) > 2 else None
+            stride = args[3] if len(args) > 3 else node.kwargs.get("stride", 1)
+            padding = args[4] if len(args) > 4 else node.kwargs.get("padding", 0)
+            dilation = args[5] if len(args) > 5 else node.kwargs.get("dilation", 1)
+            transposed = args[6] if len(args) > 6 else node.kwargs.get("transposed", False)
+            output_padding = args[7] if len(args) > 7 else node.kwargs.get("output_padding", 0)
+            groups = args[8] if len(args) > 8 else node.kwargs.get("groups", 1)
+            if transposed:
+                raise NotImplementedError("aten.convolution with transposed=True is not implemented")
+            if output_padding not in (0, [0, 0], (0, 0)):
+                raise NotImplementedError("aten.convolution with output_padding is not implemented")
+            return self.ops.convolution(
+                x,
+                weight,
+                bias=bias,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+            )
+        return convert
+
+    def _wrap_conv2d(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            weight = args[1]
+            bias = args[2] if len(args) > 2 else node.kwargs.get("bias", None)
+            stride = args[3] if len(args) > 3 else node.kwargs.get("stride", 1)
+            padding = args[4] if len(args) > 4 else node.kwargs.get("padding", 0)
+            dilation = args[5] if len(args) > 5 else node.kwargs.get("dilation", 1)
+            groups = args[6] if len(args) > 6 else node.kwargs.get("groups", 1)
+            return self.ops.convolution(
+                x,
+                weight,
+                bias=bias,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+            )
+        return convert
+
+    def _wrap_max_pool2d(self, return_indices: bool = False):
+        def convert(node: fx.Node):
+            if return_indices:
+                raise NotImplementedError("max_pool2d_with_indices tuple result is not implemented")
+            args = self.retrieve_args(node)
+            x = args[0]
+            kernel_size = args[1] if len(args) > 1 else node.kwargs.get("kernel_size")
+            stride = args[2] if len(args) > 2 else node.kwargs.get("stride", None)
+            padding = args[3] if len(args) > 3 else node.kwargs.get("padding", 0)
+            dilation = args[4] if len(args) > 4 else node.kwargs.get("dilation", 1)
+            ceil_mode = args[5] if len(args) > 5 else node.kwargs.get("ceil_mode", False)
+            result = self.ops.max_pool2d(
+                x,
+                kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                ceil_mode=ceil_mode,
+                return_indices=return_indices,
+            )
+            return result
+        return convert
+
+    def _wrap_avg_pool2d(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            kernel_size = args[1] if len(args) > 1 else node.kwargs.get("kernel_size")
+            stride = args[2] if len(args) > 2 else node.kwargs.get("stride", None)
+            padding = args[3] if len(args) > 3 else node.kwargs.get("padding", 0)
+            ceil_mode = args[4] if len(args) > 4 else node.kwargs.get("ceil_mode", False)
+            count_include_pad = args[5] if len(args) > 5 else node.kwargs.get("count_include_pad", True)
+            divisor_override = args[6] if len(args) > 6 else node.kwargs.get("divisor_override", None)
+            return self.ops.avg_pool2d(
+                x,
+                kernel_size,
+                stride=stride,
+                padding=padding,
+                ceil_mode=ceil_mode,
+                count_include_pad=count_include_pad,
+                divisor_override=divisor_override,
+            )
+        return convert
+
+    def _wrap_adaptive_avg_pool2d(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            output_size = args[1] if len(args) > 1 else node.kwargs.get("output_size")
+            if output_size == 1 or output_size == [1, 1] or output_size == (1, 1):
+                return self.ops.mean(x, dim=[2, 3], keepdim=True)
+            raise NotImplementedError("adaptive_avg_pool2d currently supports output_size=1 only")
+        return convert
+
+    def _wrap_index_tensor(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            indices = args[1]
+            if len(indices) != 1 or indices[0] is None:
+                raise NotImplementedError("aten.index.Tensor currently supports a single tensor index")
+            return self.ops.index_tensor(x, indices[0])
+        return convert
+
+    def _wrap_scatter(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            dim = args[1]
+            index = args[2]
+            src = args[3]
+            return self.ops.scatter(x, dim, index, src)
         return convert
 
     def _wrap_unary(self, op_func):
@@ -296,6 +473,26 @@ class FXGraphTranslator:
             return self.ops.reshape(x, shape)
         return convert
 
+    def _wrap_flatten(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            start_dim = args[1] if len(args) > 1 else node.kwargs.get("start_dim", 0)
+            end_dim = args[2] if len(args) > 2 else node.kwargs.get("end_dim", -1)
+            return self.ops.flatten(x, start_dim=start_dim, end_dim=end_dim)
+        return convert
+
+    def _wrap_dropout(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            p = args[1] if len(args) > 1 else node.kwargs.get("p", 0.5)
+            training = args[2] if len(args) > 2 else node.kwargs.get("training", True)
+            if p == 0 or training is False:
+                return x
+            raise NotImplementedError("dropout is only supported for p=0 or training=False")
+        return convert
+
     def _wrap_slice(self):
         def convert(node: fx.Node):
             args = self.retrieve_args(node)
@@ -336,6 +533,25 @@ class FXGraphTranslator:
         def convert(node: fx.Node):
             args = self.retrieve_args(node)
             return self.ops.unsqueeze(args[0], args[1])
+        return convert
+
+    def _wrap_contiguous(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            return args[0]
+        return convert
+
+    def _wrap_size(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            dims = self.ops.shape_of(x)
+            if len(args) > 1:
+                dim = args[1]
+                if isinstance(dim, int):
+                    return dims[dim]
+                return dims[dim.get_nat()] if hasattr(dim, "get_nat") else dims[dim]
+            return dims
         return convert
 
     def _wrap_cat(self):
@@ -445,6 +661,12 @@ class FXGraphTranslator:
                 self.ops.sym_map[sym_name] = sym_param
 
         actual_inputs = [lam.var().proj(num_params, i) for i in range(num_sym, num_sym + num_inputs)]
+        if hasattr(self, "input_shapes"):
+            for actual_input, shape in zip(actual_inputs[:len(placeholders)], self.input_shapes):
+                self.ops._remember_shape(actual_input, shape)
+        if hasattr(self, "param_shapes"):
+            for actual_input, shape in zip(actual_inputs[len(placeholders):], self.param_shapes):
+                self.ops._remember_shape(actual_input, shape)
         result = self.translate(graph, actual_inputs)
 
         dom_with_ret.set(num_params - 1, self.world.cn([result.type()]))
