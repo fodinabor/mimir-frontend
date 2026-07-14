@@ -447,7 +447,7 @@ def test_sum_reduce_static_3d_shapes(dim, keepdim, expected_shape):
     assert isinstance(result, mim.Def)
     assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
     ir = def_to_string(result)
-    assert "%tensor.map_reduce_aff" in ir
+    assert "%tensor.map_reduce" in ir
     assert expected_shape in ir
 
 
@@ -463,7 +463,7 @@ def test_sum_reduce_all_shape_kinds_smoke(shape_kind, rank, dim, keepdim):
 
     assert isinstance(result, mim.Def)
     assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
-    assert "%tensor.map_reduce_aff" in def_to_string(result)
+    assert "%tensor.map_reduce" in def_to_string(result)
 
 
 @pytest.mark.parametrize("shape_kind", ["static", "dynamic"])
@@ -479,7 +479,7 @@ def test_amax_reduce_all_shape_kinds_smoke(shape_kind, rank, dim, keepdim):
     assert isinstance(result, mim.Def)
     assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
     ir = def_to_string(result)
-    assert "%tensor.map_reduce_aff" in ir
+    assert "%tensor.map_reduce" in ir
 
 
 @pytest.mark.parametrize("shape_kind", ["static", "dynamic"])
@@ -495,7 +495,7 @@ def test_mean_reduce_all_shape_kinds_smoke(shape_kind, rank, dim, keepdim):
     assert isinstance(result, mim.Def)
     assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
     ir = def_to_string(result)
-    assert "%tensor.map_reduce_aff" in ir
+    assert "%tensor.map_reduce" in ir
     assert "%tensor.unary" in ir
 
 
@@ -573,7 +573,7 @@ def test_value_only_max(shape_kind, rank):
     assert isinstance(result, mim.Def)
     assert tensor_element_type(result) == FXGraphTranslator(world).ops.F32
     ir = def_to_string(result)
-    assert "%tensor.map_reduce_aff" in ir
+    assert "%tensor.map_reduce" in ir
 
 def test_tuple_max_is_unsupported():
     class Model(torch.nn.Module):
@@ -596,7 +596,7 @@ def test_var_mean_all_shape_kinds_smoke(shape_kind, rank, dim, keepdim):
     assert isinstance(result, mim.Def)
     # var_mean returns a tuple of (var, mean)
     ir = def_to_string(result)
-    assert "%tensor.map_reduce_aff" in ir
+    assert "%tensor.map_reduce" in ir
 
 def test_bitwise_and_logical_not():
     class Model(torch.nn.Module):

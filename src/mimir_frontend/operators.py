@@ -489,7 +489,7 @@ class OperatorLibrary:
 
     def _reduce_aff(self, input, output_type, reducer, init, dim=None, keepdim=False, return_shape=False):
         """
-        Translates reduction operations into `%tensor.map_reduce_aff`.
+        Translates reduction operations into `%tensor.map_reduce`.
         Uses ShapeRules.reduce_shape_spec as the canonical source for reduce shape invariants.
         """
         input_dims = self.shape_of(input)
@@ -500,7 +500,7 @@ class OperatorLibrary:
         reduce_rank = len(spec.reduce_dims)
         total_rank = output_rank + reduce_rank
 
-        callee = self.world.annex(tensor.map_reduce_aff.value)
+        callee = self.world.annex(tensor.map_reduce.value)
         callee = self.world.app(callee, self.world.lit_nat(1)) # nis = 1 input tensor
         callee = self._apply_grouped(callee, [output_type, self.world.lit_nat(output_rank), self.world.lit_nat(reduce_rank)])
         callee = self._apply_grouped(callee, [self.world.tuple(spec.output_dims), self.world.tuple(spec.loop_dims)])
@@ -536,13 +536,13 @@ class OperatorLibrary:
 
     def sum(self, input, dim=None, keepdim=False):
         """
-        Translates to a summation via `%tensor.map_reduce_aff`.
+        Translates to a summation via `%tensor.map_reduce`.
         """
         return self._reduce_aff(input, self.F32, self._f32_reduce_lambda(self.f32_add_axm), self._f32_float_lit(0.0), dim=dim, keepdim=keepdim)
 
     def amax(self, input, dim=None, keepdim=False):
         """
-        Translates to maximum reduction via `%tensor.map_reduce_aff`.
+        Translates to maximum reduction via `%tensor.map_reduce`.
         """
         return self._reduce_aff(input, self.F32, self._f32_reduce_lambda(self.f32_max_axm), self._f32_float_lit(-float("inf")), dim=dim, keepdim=keepdim)
 

@@ -539,7 +539,7 @@ class FXGraphTranslator:
 def get_high_level_phase(world: mim.World) -> mim.Def:
     from mim._plugins.tensor import tensor as mim_tensor
     
-    internal_cleanup = world.annex(mim_compile.internal_cleanup_phase.value)
+    internal_cleanup = world.annex(mim_compile.internal_cleanup.value)
     lower_tensor = world.annex(mim_tensor.lower_tensor.value)
     fuse_tensor = world.annex(mim_tensor.fuse_tensor.value)
     
