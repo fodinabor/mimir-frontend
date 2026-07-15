@@ -7,7 +7,7 @@ A PyTorch FX graph importer for MimIR.
 This project vendors its tested MimIR revision as a submodule. Clone with submodules:
 
 ```bash
-git clone --recursive <repo-url>
+git clone --recursive git@github.com:hsqStephenZhang/mimir-frontend.git
 cd mimir-frontend
 ```
 
@@ -30,11 +30,32 @@ After editing MimIR locally, rebuild and resync with the same command.
 
 ## Running Tests
 
-Use `uv run pytest` to run the tests:
+Use `uv run --no-sync pytest -q` after bootstrap:
 
 ```bash
-uv run pytest
+uv run --no-sync pytest -q
 ```
+
+## Fresh Clone Smoke Test
+
+The expected mentor workflow is:
+
+```bash
+git clone --recursive git@github.com:hsqStephenZhang/mimir-frontend.git
+cd mimir-frontend
+./scripts/bootstrap_mimir.sh
+uv run --no-sync python -c 'import mim; print("mim import ok")'
+uv run --no-sync pytest -q
+```
+
+This was verified from a clean clone with:
+
+```text
+166 passed, 6 skipped
+```
+
+If pytest reports a cache warning about `.pytest_cache` under a sandboxed runner,
+it is an environment permission warning and does not affect the test result.
 
 ## Architecture
 
