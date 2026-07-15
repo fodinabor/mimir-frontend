@@ -12,7 +12,7 @@ from mimir_frontend.utils import model_to_mimir
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_KERNELBENCH_DIR = Path("/Users/zc/courses/compiler/ml-compiler/KernelBench/KernelBench/level3")
+DEFAULT_KERNELBENCH_DIR = REPO_ROOT / "KernelBench" / "KernelBench" / "level3"
 DEFAULT_OUT = REPO_ROOT / "docs" / "kernelbench_level3_report.md"
 
 
@@ -64,10 +64,14 @@ def render_report(results: list[ModelResult], kernelbench_dir: Path) -> str:
     total = len(results)
     success = sum(1 for r in results if r.status == "SUCCESS")
     failed = total - success
+    try:
+        display_kernelbench_dir = kernelbench_dir.resolve().relative_to(REPO_ROOT.resolve())
+    except ValueError:
+        display_kernelbench_dir = kernelbench_dir
     lines = []
     lines.append("# KernelBench Level 3 MimIR 导出报告")
     lines.append("")
-    lines.append(f"- KernelBench 目录: `{kernelbench_dir}`")
+    lines.append(f"- KernelBench 目录: `{display_kernelbench_dir}`")
     lines.append("- 导出入口: `scripts/export_models_to_mimir.py`")
     lines.append("- 模型约定: `Model` + `get_inputs()` + `get_init_inputs()`，或 `export_to_mim = export(...)`")
     lines.append("")

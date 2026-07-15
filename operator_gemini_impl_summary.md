@@ -24,7 +24,7 @@
 | addmm | 已支持 `aten.addmm.default`，按 `mm(input, mat2) + bias` 分解，bias 通过现有 broadcast 语义处理。 | `src/mimir_frontend/translator.py`, `tests/test_basic.py`, `tests/test_real_inductor_graphs.py` |
 | split.Tensor | 已支持 `aten.split.Tensor`，通过现有 `tensor.slice` 组合实现；静态 literal 维度可进行按 size 分块。 | `src/mimir_frontend/translator.py`, `src/mimir_frontend/operators.py`, `tests/test_basic.py`, `tests/test_real_inductor_graphs.py` |
 | reduce 基础路径 | 已使用 `%tensor.map_reduce_aff` 支持 `sum`、`amax`、`mean`、`var_mean` 的 global、单维、多维、`keepdim=True/False` 形态。 | `src/mimir_frontend/operators.py`, `tests/test_basic.py` |
-| MimIR binding | 已补充 `World.sigma`，用于构造 `mean` reducer 所需的异构 product type；已补充 `Lit.get_nat()`，用于 Python frontend 读取静态 Nat literal 并实现可靠 broadcast 判断。 | `/Users/zc/courses/compiler/MimIR/py/bindings/world.cpp`, `/Users/zc/courses/compiler/MimIR/py/bindings/def.cpp` |
+| MimIR binding | 已补充 `World.sigma`，用于构造 `mean` reducer 所需的异构 product type；已补充 `Lit.get_nat()`，用于 Python frontend 读取静态 Nat literal 并实现可靠 broadcast 判断。 | MimIR 仓库 `py/bindings/world.cpp`, `py/bindings/def.cpp` |
 | MimIR dump utility | 已新增 `model_to_mimir`，支持 high-level tensor IR dump，并可选择加载 default compile/opt 插件。 | `src/mimir_frontend/utils.py`, `tests/test_utils.py` |
 | where 和 clamp scalar | `where` 使用了 `tensor.select` binding enum，支持 scalar branch broadcast 到 condition/common shape；`clamp` 支持 scalar bounds。 | `src/mimir_frontend/operators.py`, `tests/test_basic.py` |
 | max | 支持 value-only `torch.max(x)`，重载通过检查参数区分。 | `src/mimir_frontend/translator.py`, `tests/test_basic.py` |
@@ -33,7 +33,7 @@
 | get_attr 和 getattr | 支持了 FX `get_attr` 节点（从 module 提取属性）和 `builtins.getattr` (用于 `x.shape` 提取)。 | `src/mimir_frontend/translator.py` |
 | hardcoded annex id | 生产代码中的 `tensor.select` 和 `tensor.product_2d` 已全部改为 binding enum；`rg "0x5463|world\\.annex\\([0-9]" src tests` 当前无命中。 | `src/mimir_frontend/operators.py`, `tests/draft_ops_end.py` |
 | FileCheck 风格测试基建 | 新增 `assert_ir_contains_in_order`，用于比较 IR 内容中的预期序列，避免只测 `isinstance`。 | `tests/test_basic.py` |
-| 真实 Inductor readable graph 测试 | 新增 loader，可直接从 `/Users/zc/courses/compiler/pytorch-play/logs/attn_debug/inductor/*/fx_graph_readable.py` trace FX graph，并构造 MimIR placeholder。 | `src/mimir_frontend/inductor_readable.py`, `tests/test_real_inductor_graphs.py` |
+| 真实 Inductor readable graph 测试 | 新增 loader，可直接从 `MIMIR_INDUCTOR_LOG_ROOT/*/fx_graph_readable.py` trace FX graph，并构造 MimIR placeholder。 | `src/mimir_frontend/inductor_readable.py`, `tests/test_real_inductor_graphs.py` |
 | 真实图 MimIR dump 脚本 | 新增 `scripts/dump_inductor_mimir.py`，支持完整 dump；遇到 unsupported frontier 时可用 `--partial` 打印最后一个成功节点的 IR。 | `scripts/dump_inductor_mimir.py` |
 
 ## 当前支持面
@@ -106,7 +106,7 @@
 | --- | --- | --- |
 | `compile_phase="default"` 的 native crash | 仍然存在于 `LowerMapReduce` 阶段。 | 待 MimIR core 修复或进一步排查符号化广播问题。 |
 | dynamic broadcast 的符号等价判断 | 当前 Python frontend 无法证明两个不同 symbol 是否相等；对于无法静态判断的维度，broadcast common shape 会保守选择左侧维度。 | 后续如果 MimIR 侧有 shape constraint 表达，可以在 importer 中记录 symbol equality/compatibility。 |
-| MimIR binding 依赖 | `Lit.get_nat()` 已在 `/Users/zc/courses/compiler/MimIR/py/bindings/def.cpp` 增加，并需要通过 CMake 重新构建 `mim_py` 后在 uv 环境中使用。 | 修改 binding 后运行 `cmake --build /Users/zc/courses/compiler/MimIR/build --target mim_py -j 8`，再安装 staged package。 |
+| MimIR binding 依赖 | `Lit.get_nat()` 已在 MimIR 仓库 `py/bindings/def.cpp` 增加，并需要通过 CMake 重新构建 `mim_py` 后在 uv 环境中使用。 | 修改 binding 后在 MimIR 仓库运行 `cmake --build build --target mim_py -j 8`，再安装 staged package。 |
 | `split` 算子的动态性 | 目前仅支持 static extent 的分割。 | 遇到动态分割模型时再考虑增强。 |
 | `mlp_0` native crash | `mlp_0` 在越过 `le.Scalar/where` 后触发 MimIR native crash，当前不放入 pytest 普通路径。 | 单独用 `scripts/dump_inductor_mimir.py mlp_0 --partial` 或最小化 IR 后排查 MimIR core / shape 表达。 |
 | 非 CNN 下一批 blocker | 非 CNN 真实图下一批主要卡在 `index/scatter_add`、`max.dim`、`bmm`、random/dropout prims。 | 建议下一轮先做 `index.Tensor` + `scatter_add` 或 `max.dim`；Transformer 方向则优先 `bmm`。 |

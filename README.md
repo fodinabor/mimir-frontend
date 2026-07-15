@@ -4,20 +4,36 @@ A PyTorch FX graph importer for MimIR.
 
 ## Setup
 
-This project uses `uv`. To set up the environment:
+This project vendors its tested MimIR revision as a submodule. Clone with submodules:
 
 ```bash
-uv sync
+git clone --recursive <repo-url>
+cd mimir-frontend
 ```
 
-Note: Ensure that `MimIR` and `pytorch` are available at the relative paths specified in `pyproject.toml`.
+Then build the local MimIR Python binding and sync the Python environment:
+
+```bash
+./scripts/bootstrap_mimir.sh
+```
+
+The script initializes recursive submodules, creates a Python 3.14 `uv` venv,
+builds MimIR's `mim_py` target, and runs `uv sync`.
+
+The `mim` dependency is resolved from the local submodule build output:
+
+```toml
+mim = { path = "MimIR/build/mim_py_stage/main" }
+```
+
+After editing MimIR locally, rebuild and resync with the same command.
 
 ## Running Tests
 
 Use `uv run pytest` to run the tests:
 
 ```bash
-uv run pytest tests/test_basic.py
+uv run pytest
 ```
 
 ## Architecture

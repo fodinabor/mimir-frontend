@@ -5,9 +5,9 @@
 参考资料：
 
 - PyTorch Dynamic Shapes: https://docs.pytorch.org/docs/2.12/user_guide/torch_compiler/compile/dynamic_shapes_core_concepts.html
-- TVM importer 标杆：`/Users/zc/courses/compiler/ml-compiler/tvm/python/tvm/relax/frontend/torch/base_fx_graph_translator.py`
-- TVM Relax: `/Users/zc/Readings/relax.pdf`
-- MimIR tensor axioms: `/Users/zc/courses/compiler/MimIR/src/mim/plug/tensor/tensor.mim`
+- TVM importer 标杆：TVM 仓库 `python/tvm/relax/frontend/torch/base_fx_graph_translator.py`
+- TVM Relax: TVM Relax 文档或论文
+- MimIR tensor axioms: MimIR 仓库 `src/mim/plug/tensor/tensor.mim`
 
 当前阶段暂停额外算子覆盖，等待 MimIR 侧 `gather`、`scatter`、`conv2d` 等 axiom。本文只规划不依赖这些新 axiom 的 dynamic shape 基建。
 

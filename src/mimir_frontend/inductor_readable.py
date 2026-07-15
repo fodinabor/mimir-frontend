@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import inspect
+import os
 import re
 from pathlib import Path
 
@@ -13,7 +14,10 @@ from .translator import FXGraphTranslator
 from .utils import ShapeEnv, _shape_from_meta_value, shape_to_mimir_dims, tensor_type_from_shape
 
 
-DEFAULT_INDUCTOR_LOG_ROOT = Path("/Users/zc/courses/compiler/pytorch-play/logs/attn_debug/inductor")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_INDUCTOR_LOG_ROOT = Path(
+    os.environ.get("MIMIR_INDUCTOR_LOG_ROOT", REPO_ROOT / "inductor_logs" / "attn_debug" / "inductor")
+)
 
 
 @dataclass

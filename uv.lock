@@ -145,7 +145,7 @@ wheels = [
 [[package]]
 name = "mim"
 version = "0.1.0"
-source = { directory = "../../MimIR/build/mim_py_stage/main" }
+source = { directory = "MimIR/build/mim_py_stage/main" }
 
 [[package]]
 name = "mimir-frontend"
@@ -160,7 +160,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mim", directory = "../../MimIR/build/mim_py_stage/main" },
+    { name = "mim", directory = "MimIR/build/mim_py_stage/main" },
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "pytest" },
     { name = "torch" },

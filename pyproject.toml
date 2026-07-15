@@ -20,7 +20,11 @@ where = ["src"]
 mimir_frontend = ["py.typed"]
 
 [tool.uv.sources]
-mim = { path = "../../MimIR/build/mim_py_stage/main" }
+mim = { path = "MimIR/build/mim_py_stage/main" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["KernelBench"]
 
 [tool.ty.environment]
 python = ".venv"

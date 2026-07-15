@@ -2,7 +2,13 @@ import re
 
 import pytest
 
-from mimir_frontend.inductor_readable import translate_inductor_readable
+from mimir_frontend.inductor_readable import DEFAULT_INDUCTOR_LOG_ROOT, translate_inductor_readable
+
+
+pytestmark = pytest.mark.skipif(
+    not DEFAULT_INDUCTOR_LOG_ROOT.exists(),
+    reason="set MIMIR_INDUCTOR_LOG_ROOT to run real Inductor graph tests",
+)
 
 
 @pytest.mark.parametrize(
